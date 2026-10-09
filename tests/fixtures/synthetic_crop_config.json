@@ -1,0 +1,10 @@
+{
+  "synthetic_example_only": true,
+  "note": "Not a real-run recommendation. Pass only the recipe object to CropConfig.from_dict.",
+  "recipe": {
+    "near_size_xy_um": [2, 2],
+    "wide_size_xy_um": [4, 4],
+    "intermediate_layer_policy": "preserve_exported_layers_v1",
+    "output_pitch_um": 0.5
+  }
+}
