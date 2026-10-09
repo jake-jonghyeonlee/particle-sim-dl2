@@ -94,12 +94,12 @@ def test_index_schema_dimension_and_zero_vectors_fail(source):
 def test_recall_labels_optional_and_hand_counted_primary_only(source):
     query, records = fixed_records(source)
     result = search(query, make_index(records), {'A'}, topk=3, expand=True)
-    unavailable = evaluate([result], k=1)
+    unavailable = evaluate([result], k=1, assignments={'query': 'test'}, partition='test')
     assert unavailable['status'] == 'unavailable' and unavailable['recall_at_k'] is None
     labels = [{'a': 'query', 'b': 'A1', 'relation': 'similar'},
               {'a': 'query', 'b': 'B', 'relation': 'similar'},
               {'a': 'query', 'b': 'A2', 'relation': 'different'}]
-    measured = evaluate([result], k=2, labels=labels)
+    measured = evaluate([result], k=2, labels=labels, assignments={'query': 'test'}, partition='test')
     assert measured['recall_at_k'] == .5 and measured['n_evaluable_queries'] == 1
     assert measured['counterexample_retrievals'] == [{'roi_id': 'query', 'recall': .5, 'known_different_retrieved': ['A2']}]
 

@@ -52,6 +52,12 @@ def relation_matrix(records, roi_ids):
     return labels
 
 
+def validate_label_ids(records, export_ids):
+    absent = sorted({row[key] for row in records for key in ('a', 'b')} - set(export_ids))
+    if absent:
+        raise ContractError('label_roi_ids_absent_from_export: '+','.join(absent))
+
+
 def read_labels(path):
     raw = json.loads(Path(path).read_text())
     if set(raw) != {'schema_version', 'relations'} or raw['schema_version'] != 'roi_relations_v1' or not isinstance(raw['relations'], list):
@@ -81,7 +87,12 @@ def objective(first, second, config, *, relations=None):
         raise ContractError('effective_batch_at_least_two_required')
     if not torch.isfinite(first).all() or not torch.isfinite(second).all():
         raise ContractError('finite_projections_required')
-    per_location = (first-second).square().mean(dim=1)
+    # The actual alignment pairing graph is the diagonal location correspondence.
+    # Count cross-location edges from that graph; no negative-edge graph is built.
+    alignment_pairs = torch.eye(len(first), dtype=torch.bool, device=first.device)
+    cross_location_pairs = alignment_pairs & ~torch.eye(len(first), dtype=torch.bool, device=first.device)
+    pair_indices = alignment_pairs.nonzero()
+    per_location = (first[pair_indices[:, 0]]-second[pair_indices[:, 1]]).square().mean(dim=1)
     alignment = per_location.mean()
     variances, covariances = [], []
     for tensor in (first, second):
@@ -93,14 +104,17 @@ def objective(first, second, config, *, relations=None):
         covariances.append(off_diagonal.square().sum()/tensor.shape[1])
     variance = sum(variances)/2
     covariance = sum(covariances)/2
-    supervised, known_count = first.sum()*0, 0
+    supervised, known_count, different_count = first.sum()*0, 0, 0
     if relations is not None:
         combined = F.normalize((first+second)/2, dim=1)
         logits = combined @ combined.T / config.supervised_temperature
         supervised, known_count = supervised_term(logits, relations.to(first.device))
+        different_count = int(torch.triu(relations == 0, diagonal=1).sum())
     total = (config.alignment_weight*alignment + config.variance_weight*variance
              + config.covariance_weight*covariance + config.supervised_weight*supervised)
     return {'total': total, 'alignment': alignment, 'variance': variance, 'covariance': covariance,
             'supervised': supervised, 'alignment_per_location': per_location,
-            'positive_pair_count': len(first), 'negative_pair_count': 0,
+            'positive_pair_count': int(alignment_pairs.sum()), 'negative_pair_count': int(cross_location_pairs.sum()),
+            'supervised_different_pair_count': different_count,
+            'alignment_pair_indices': pair_indices.tolist(),
             'supervised_known_pair_count': known_count}

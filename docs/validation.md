@@ -18,8 +18,9 @@ all 64 T10 tests remain included. The suite covers:
 - Hand-calculated near/wide area coverage of a one-native-cell thin line and a
   valid hole, plus recorded transform versions and padding coverage.
 - Same-location jitter with common transforms, missing configuration errors,
-  observed core checks, native component clipping, and removed bridges at the
-  same physical centre. These are conservative structural acceptance checks.
+  observed core checks, core connectivity equality and removed bridges at the
+  same physical centre, including bridges outside the core. Remote clipping is
+  allowed when it leaves core content/connectivity unchanged.
 - Label-free views → encoder → finite loss → finite gradients, without training
   or labels; variable set sizes and order invariance, role/layer conditioning,
   invalid/all-padding channels and local-file weights.
@@ -38,8 +39,8 @@ all 64 T10 tests remain included. The suite covers:
 - Socket-blocked module help and nontraining checkpoint → index → single-query
   search → optional-label evaluation, including stale transform rejection.
 
-The CNN, conditioning/aggregation, objective coefficients, conservative native
-component policy and synthetic label schema are reviewable baseline choices.
+The CNN, conditioning/aggregation, objective coefficients, versioned common-core
+connectivity policy and synthetic label schema are reviewable baseline choices.
 Independent Opus review is required for this candidate; these tests are not an
 independent PASS or real-data performance validation.
 
@@ -98,3 +99,14 @@ Follow-up execution results:
 The skipped default item states that multi-epoch synthetic training requires
 explicit `--run-training`. The always-run smoke performs exactly one optimiser
 step, as explicitly authorised by this follow-up task.
+
+
+R4 changed crop/view acceptance and the operational notes; current status,
+regression cases and final commands are recorded in [R4_FIXES.md](review/R4_FIXES.md).
+The original R4 FAIL report is preserved unchanged.
+
+
+R4-fix candidate validation: default **142 passed, 1 skipped in 9.31s**;
+`--run-training` **143 passed in 9.62s**. Exact commands and per-finding
+regressions are in the fix report linked above. Independent re-review remains
+pending; these author-run checks do not replace it.

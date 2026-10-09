@@ -55,11 +55,13 @@ def test_index_search_evaluate_cli_nontraining_roundtrip(source, tmp_path, capsy
     assert result['primary'][0]['roi_id'] == 'candidate_A'
     assert result['primary'][0]['score'] == 1
     results = tmp_path/'results.json'; results.write_text(json.dumps([result]))
-    assert evaluate_main([str(results), '--k', '1']) == 3
+    split = tmp_path/'evaluation_split.json'; split.write_text(json.dumps({roi.row['roi_id']: 'test'}))
+    eval_args = [str(results), '--k', '1', '--split', str(split), '--partition', 'test']
+    assert evaluate_main(eval_args) == 3
     assert json.loads(capsys.readouterr().out)['recall_at_k'] is None
     labels = tmp_path/'labels.json'; labels.write_text(json.dumps({'schema_version': 'roi_relations_v1',
         'relations': [{'a': roi.row['roi_id'], 'b': 'candidate_A', 'relation': 'similar'}]}))
-    assert evaluate_main([str(results), '--k', '1', '--labels', str(labels)]) == 0
+    assert evaluate_main(eval_args+['--labels', str(labels)]) == 0
     assert json.loads(capsys.readouterr().out)['recall_at_k'] == 1
     index['view_fingerprint'] = 'c'*64; index_path.write_text(json.dumps(index))
     assert search_main(args) == 2

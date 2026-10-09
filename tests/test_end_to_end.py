@@ -122,6 +122,21 @@ def test_opt_in_real_cli_train_resume_index_search_evaluate(tmp_path, capsys, re
     for entry in resumed['history']:
         assert all(np.isfinite(entry[key]) for key in ('total', 'alignment', 'variance', 'covariance', 'supervised'))
     assert raw['target_epochs'] == 4
+    # R4 independently reproduced exact uninterrupted-vs-resume equality; retain
+    # that evidence as an opt-in regression rather than checking epochs alone.
+    continuous_path = tmp_path/'continuous.pt'
+    continuous_args = args.copy(); continuous_args[continuous_args.index('--out')+1] = str(continuous_path)
+    assert train_main(continuous_args) == 0
+    continuous_result = json.loads(capsys.readouterr().out)
+    continuous = torch.load(continuous_path, weights_only=True)
+    assert continuous['model_fingerprint'] == raw['model_fingerprint']
+    assert continuous['rng']['views'] == raw['rng']['views']
+    torch.testing.assert_close(continuous['rng']['torch'], raw['rng']['torch'])
+    assert resumed['epoch_history'] == [
+        {'epoch': 3, 'accepted_pair_count': 2, 'rejected_pair_count': 0, 'rejection_reasons': {}},
+        {'epoch': 4, 'accepted_pair_count': 2, 'rejected_pair_count': 0, 'rejection_reasons': {}}]
+    assert all(row['accepted_pair_count'] == 2 and row['rejected_pair_count'] == 0
+               for row in resumed['history'])
     before = checkpoint_path.read_bytes()
     assert train_main(args+['--resume', str(checkpoint_path)]) == 2
     assert 'resume_target_epochs_must_exceed_saved_epoch' in capsys.readouterr().err
@@ -152,7 +167,7 @@ def test_opt_in_real_cli_train_resume_index_search_evaluate(tmp_path, capsys, re
             assert expected_fields | {'score', 'search_scope'} <= row.keys()
             assert row['search_scope'] == scope and np.isfinite(row['score'])
     results = tmp_path/'results.json'; results.write_text(json.dumps([expanded]))
-    assert evaluate_main([str(results), '--k', '2']) == 3
+    assert evaluate_main([str(results), '--k', '2', '--split', str(tmp_path/'split.json'), '--partition', 'train']) == 3
     metrics = json.loads(capsys.readouterr().out)
     assert metrics['status'] == 'unavailable' and metrics['recall_at_k'] is None
     assert metrics['reason'] == 'correspondence_labels_not_supplied'

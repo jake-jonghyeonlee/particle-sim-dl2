@@ -77,9 +77,12 @@ nonintegral sizes fail rather than silently rounding physical extent. Before
 resampling the native size in pixels is recorded as `size_um / source_pitch_um`.
 Changing source pitch changes native pixel count, not the requested physical area.
 
-`physical_cell_centres_nearest_v1` samples the source cell containing each output
+`physical_cell_centres_nearest_exact_v2` samples the source cell containing each output
 cell's physical centre (floor of the source coordinate). Exact cell-boundary ties
-go to the higher source index. The same x/y index vectors apply to every layout,
+go to the higher source index. Indices are computed with rational arithmetic
+on the declared decimal numbers, not by floating-point floor. The same exact
+overlap endpoints determine `physical_cell_area_coverage_exact_v2` weights;
+only final coverage weights are converted to floats. The same x/y index vectors apply to every layout,
 CNT, VIA and valid channel. No channel gets its own centre or transform. An
 unaligned physical centre can require sampling even at unchanged pitch; metadata
 marks this as resampled. Nearest-cell sampling preserves binary channel values
@@ -105,4 +108,30 @@ are installed ahead of time using the pinned local environment snapshot.
 T10 tests use an actual producer export plus hand-calculated crop oracles and
 socket-blocking fixtures. Model, training, augmentation validity, query/index
 search and CA measurement are outside this implementation. Real recipe selection,
-real-data acceptance, independent review and T11/T12 remain pending.
+real-data acceptance, independent re-review and T12 remain pending; T11 model
+and training features are documented separately in training.md.
+
+
+## Producer revision in the closed network
+
+By default a producer revision is checked for 40-character lowercase hexadecimal
+format. That is an identity/format check, not a declaration that every such
+revision has been compatibility tested. Use `expected_producer_commit` or
+`psdl2.data --expected-producer-commit` to pin the exact approved producer revision;
+carry that revision and the original source/asset hashes into the handoff record.
+The supplied fixture proves compatibility only for its recorded producer commit.
+
+A copied/installed producer outside Git may export `producer_commit=null` with a
+reason. Preferred procedure: retain the reviewed producer code revision when
+packaging it and have the producer explicitly record that revision. If it cannot
+be recorded, a caller must explicitly use `allow_unversioned_producer=True` or
+`--allow-unversioned-producer` (data/train/index/search). Without that choice the
+export fails closed. A nonempty reason is required, and outputs/checkpoints
+record the null revision, reason and `unversioned_producer_accepted=true`.
+This flag does not bypass schema/identity/hash/observation checks or imply a
+compatibility PASS. It cannot satisfy an explicit expected commit pin.
+
+Only declared asset kind/binding and bytes/hash can be validated. A file named
+`hotspot.npy` falsely declared as an original layout cannot be identified by
+filename or binary appearance; correct original-layout provenance remains the
+producer's responsibility. Hotspot/CA/Fab fields themselves are rejected.

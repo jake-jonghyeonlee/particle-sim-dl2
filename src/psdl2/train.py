@@ -1,5 +1,6 @@
 """Explicit local training entry point; nothing trains during import."""
 import argparse
+from collections import Counter
 import json
 from pathlib import Path
 import random
@@ -10,7 +11,7 @@ import torch
 
 from .checkpoint import fingerprint, load_checkpoint, save_checkpoint
 from .data import load_export
-from .losses import LossConfig, objective, read_labels, relation_matrix
+from .losses import LossConfig, objective, read_labels, relation_matrix, validate_label_ids
 from .model import Encoder, ModelConfig
 from .schema import ContractError, number
 from .split import record_for_roi, validate_split
@@ -39,16 +40,21 @@ def paired_forward(model, rois, view_config, loss_config, rng, *, labels=None):
             first.append(a); second.append(b); ids.append(roi.row['roi_id'])
         except ContractError as exc:
             rejected.append({'roi_id': roi.row['roi_id'], 'reason': str(exc)})
+    reason_counts = dict(Counter(row['reason'] for row in rejected))
     if len(first) < 2:
-        raise ContractError('effective_batch_at_least_two_required_after_view_rejection')
+        raise ContractError('effective_batch_at_least_two_required_after_view_rejection: '+json.dumps(
+            {'accepted_pair_count': len(first), 'rejected_pair_count': len(rejected), 'reasons': reason_counts}, sort_keys=True))
     z1 = model(first)['projection']; z2 = model(second)['projection']
     relations = None if labels is None else relation_matrix(labels, ids)
     losses = objective(z1, z2, loss_config, relations=relations)
+    losses.update(accepted_pair_count=len(first), rejected_pair_count=len(rejected), rejection_reasons=reason_counts)
     return losses, rejected
 
 
 def train(rois, config, output, *, lineages, assignments, labels=None, resume=None):
     view_config = ViewConfig.from_dict(config['views'])
+    if labels is not None:
+        validate_label_ids(labels, [r.row['roi_id'] for r in rois])
     records = [record_for_roi(r, lineages[r.row['product_id']], view_config) for r in rois]
     split = validate_split(records, assignments)
     training = [r for r in rois if r.row['roi_id'] in split['train']]
@@ -70,24 +76,30 @@ def train(rois, config, output, *, lineages, assignments, labels=None, resume=No
         epoch = load_checkpoint(resume, model, accepted, optimizer=optimizer, restore_rng=True, view_rng=rng)
         if config['epochs'] <= epoch:
             raise ContractError('resume_target_epochs_must_exceed_saved_epoch')
-    history = []
+    history, epoch_history = [], []
     for current in range(epoch, config['epochs']):
         order = rng.permutation(len(training)).tolist()
         batches = [order[i:i+config['batch_size']] for i in range(0, len(order), config['batch_size'])]
         if len(batches) > 1 and len(batches[-1]) == 1:
             batches[-2].extend(batches.pop())
         model.train()
+        epoch_accepted, epoch_rejected, epoch_reasons = 0, 0, Counter()
         for batch in batches:
             optimizer.zero_grad(set_to_none=True)
             losses, rejected = paired_forward(model, [training[i] for i in batch], view_config,
                                                LossConfig(**config['loss']), rng, labels=labels)
             losses['total'].backward(); optimizer.step()
+            epoch_accepted += losses['accepted_pair_count']; epoch_rejected += losses['rejected_pair_count']
+            epoch_reasons.update(losses['rejection_reasons'])
             history.append({'epoch': current+1, 'rejected_views': rejected,
                             **{key: float(value.detach()) if torch.is_tensor(value) else value
                                for key, value in losses.items() if key != 'alignment_per_location'}})
+        epoch_history.append({'epoch': current+1, 'accepted_pair_count': epoch_accepted,
+                              'rejected_pair_count': epoch_rejected, 'rejection_reasons': dict(epoch_reasons)})
         save_checkpoint(output, model, optimizer, accepted, epoch=current+1, view_rng=rng, target_epochs=config['epochs'])
     return {'status': 'completed', 'epochs': config['epochs'], 'config_fingerprint': fingerprint(accepted),
-            'split': split, 'history': history, 'performance_status': 'real_performance_pending'}
+            'split': split, 'history': history, 'epoch_history': epoch_history,
+            'unversioned_producer_accepted': any(r.versions.get('unversioned_producer_accepted', False) for r in rois), 'performance_status': 'real_performance_pending'}
 
 
 def main(argv=None):
@@ -98,9 +110,11 @@ def main(argv=None):
     parser.add_argument('--split', required=True, type=Path, help='JSON roi_id -> train/validation/test mapping')
     parser.add_argument('--labels', type=Path, help='Optional roi_relations_v1; never required')
     parser.add_argument('--resume', type=Path)
+    parser.add_argument('--allow-unversioned-producer', action='store_true')
     args = parser.parse_args(argv)
     try:
-        export = load_export(args.export, assets_root=args.assets_root)
+        export = load_export(args.export, assets_root=args.assets_root,
+                             allow_unversioned_producer=args.allow_unversioned_producer)
         result = train(export.ready, read_config(args.config), args.out,
                        lineages=json.loads(args.lineages.read_text()), assignments=json.loads(args.split.read_text()),
                        labels=None if args.labels is None else read_labels(args.labels), resume=args.resume)

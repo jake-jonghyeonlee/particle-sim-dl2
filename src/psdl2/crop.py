@@ -6,6 +6,7 @@ output cell centre, with exact configured physical extents and a common transfor
 from copy import deepcopy
 from dataclasses import asdict, dataclass
 import math
+from fractions import Fraction
 
 import numpy as np
 
@@ -27,25 +28,54 @@ class Bundle:
     metadata: dict
 
 
+def rational(value):
+    """Exact decimal value of the declared number, never its binary expansion."""
+    return Fraction(str(value))
+
+
 def _count(size, pitch):
-    cells = size / pitch
-    rounded = round(cells)
-    if rounded < 1 or not math.isclose(cells, rounded, rel_tol=1e-12, abs_tol=1e-12):
+    cells = rational(size) / rational(pitch)
+    if cells.denominator != 1 or cells < 1:
         raise ContractError('window_size_must_be_integer_multiple_of_output_pitch')
-    return rounded
+    return int(cells)
+
+
+def exact_indices(origin, pitch, count, source_origin, source_pitch):
+    offset = (origin + pitch/2 - source_origin) / source_pitch
+    step = pitch / source_pitch
+    return np.array([int((offset+i*step)//1) for i in range(count)], dtype=np.int64)
+
+
+def exact_weights(origin, pitch, count, source_origin, source_pitch, source_count):
+    weights = np.zeros((count, source_count), dtype=np.float64)
+    for i in range(count):
+        left = origin+i*pitch; right = left+pitch
+        first = max(0, int((left-source_origin)//source_pitch))
+        stop_ratio = (right-source_origin)/source_pitch
+        stop = min(source_count, -(-stop_ratio.numerator//stop_ratio.denominator))
+        for j in range(first, stop):
+            overlap = min(right, source_origin+(j+1)*source_pitch)-max(left, source_origin+j*source_pitch)
+            if overlap > 0:
+                weights[i, j] = float(overlap/pitch)
+    return weights
+
+
+def exact_bounds(patch):
+    origin = tuple(Fraction(*v) for v in patch.metadata['transform']['origin_xy_um_rational'])
+    pitch = rational(patch.grid.pixel_pitch_um)
+    return (*origin, origin[0]+patch.grid.shape_yx[1]*pitch, origin[1]+patch.grid.shape_yx[0]*pitch)
 
 
 def _patch(roi, size, pitch, resampling_mode='nearest'):
     width, height = (_count(s, pitch) for s in size)
     cx, cy = roi.center_xy_um
-    origin = (cx - size[0] / 2, cy - size[1] / 2)
+    exact_origin = tuple(rational(c)-rational(s)/2 for c, s in zip((cx, cy), size))
+    origin = tuple(float(v) for v in exact_origin)
     grid = Frame(roi.frame.frame_id, origin, pitch, (height, width))
     source = roi.frame
     # Every channel uses these same two index vectors. No channel-specific bbox.
-    sx = np.floor((origin[0] + (np.arange(width) + .5) * pitch - source.origin_xy_um[0])
-                  / source.pixel_pitch_um).astype(np.int64)
-    sy = np.floor((origin[1] + (np.arange(height) + .5) * pitch - source.origin_xy_um[1])
-                  / source.pixel_pitch_um).astype(np.int64)
+    sx, sy = (exact_indices(o, rational(pitch), count, rational(so), rational(source.pixel_pitch_um))
+              for o, count, so in zip(exact_origin, (width, height), source.origin_xy_um))
     inside_x = (sx >= 0) & (sx < source.shape_yx[1])
     inside_y = (sy >= 0) & (sy < source.shape_yx[0])
     inside = inside_y[:, None] & inside_x[None, :]
@@ -58,14 +88,9 @@ def _patch(roi, size, pitch, resampling_mode='nearest'):
     if resampling_mode == 'area_coverage':
         if pitch < source.pixel_pitch_um:
             raise ContractError('area_coverage_requires_coarser_or_equal_pitch')
-        def overlap_weights(output_origin, count, source_origin, source_count):
-            starts = output_origin + np.arange(count) * pitch
-            source_starts = source_origin + np.arange(source_count) * source.pixel_pitch_um
-            return np.maximum(0, np.minimum(starts[:, None] + pitch,
-                              source_starts[None, :] + source.pixel_pitch_um)
-                              - np.maximum(starts[:, None], source_starts[None, :])) / pitch
-        wx = overlap_weights(origin[0], width, source.origin_xy_um[0], source.shape_yx[1])
-        wy = overlap_weights(origin[1], height, source.origin_xy_um[1], source.shape_yx[0])
+        wx, wy = (exact_weights(o, rational(pitch), count, rational(so), rational(source.pixel_pitch_um), n)
+                  for o, count, so, n in zip(exact_origin, (width, height), source.origin_xy_um,
+                                            (source.shape_yx[1], source.shape_yx[0])))
         for key, mask in roi.channels.items():
             channels[key] = (wy @ mask.astype(np.float64) @ wx.T).clip(0, 1).astype(np.float32)
             channels[key].flags.writeable = False
@@ -77,19 +102,21 @@ def _patch(roi, size, pitch, resampling_mode='nearest'):
         raise ContractError('unknown_resampling_mode')
     meta = {
         'center_xy_um': [cx, cy], 'size_xy_um': list(size),
-        'bbox_xyxy_um': [*origin, origin[0] + size[0], origin[1] + size[1]],
+        'bbox_xyxy_um': [*origin, float(exact_origin[0]+rational(size[0])), float(exact_origin[1]+rational(size[1]))],
         'shape_yx': [height, width], 'output_pitch_um': pitch,
         'source_pitch_um': source.pixel_pitch_um,
         'native_size_xy_px': [s / source.pixel_pitch_um for s in size],
-        'transform_version': ('physical_cell_area_coverage_v1' if resampling_mode == 'area_coverage'
-                              else 'physical_cell_centres_nearest_v1'),
-        'transform': {'origin_xy_um': list(origin), 'pixel_pitch_um': pitch,
+        'transform_version': ('physical_cell_area_coverage_exact_v2' if resampling_mode == 'area_coverage'
+                              else 'physical_cell_centres_nearest_exact_v2'),
+        'boundary_tie_rule': 'higher_source_index_half_open',
+        'source_indices_xy': [sx.tolist(), sy.tolist()],
+        'transform': {'origin_xy_um': list(origin),
+                      'origin_xy_um_rational': [[v.numerator, v.denominator] for v in exact_origin], 'pixel_pitch_um': pitch,
                       'axis_order': 'yx', 'origin_convention': 'top_left_cell_edge',
                       'source_origin_xy_um': list(source.origin_xy_um)},
         'resampled': pitch != source.pixel_pitch_um or any(
-            not math.isclose((o - so) / source.pixel_pitch_um, round((o - so) / source.pixel_pitch_um),
-                             rel_tol=0, abs_tol=1e-10)
-            for o, so in zip(origin, source.origin_xy_um)),
+            ((o-rational(so))/rational(source.pixel_pitch_um)).denominator != 1
+            for o, so in zip(exact_origin, source.origin_xy_um)),
         'valid_coverage': {'valid_cells': valid_count, 'total_cells': height * width,
                            'valid_fraction': valid_count / (height * width),
                            'outside_frame_cells': int((~inside).sum()),

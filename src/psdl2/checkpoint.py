@@ -35,6 +35,11 @@ def atomic_torch_save(payload, path):
         with os.fdopen(handle, 'wb') as stream:
             torch.save(payload, stream); stream.flush(); os.fsync(stream.fileno())
         os.replace(temporary, path)
+        directory = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
     finally:
         if os.path.exists(temporary):
             os.unlink(temporary)

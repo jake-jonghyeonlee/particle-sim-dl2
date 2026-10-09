@@ -44,7 +44,8 @@ def validate_record(record):
     signature = record['case_signature']
     if set(signature) != {'failure_type', 'analysis_layer', 'endpoints', 'connection_observation', 'cnt_binding', 'via_count'}:
         raise ContractError('complete_case_signature_required')
-    if signature['endpoints'] != signature['cnt_binding']:
+    endpoint_key = lambda ep: (ep['electrode_id'], ep['role'], ep['actual_layer'])
+    if sorted(map(endpoint_key, signature['endpoints'])) != sorted(map(endpoint_key, signature['cnt_binding'])):
         raise ContractError('CNT_endpoint_binding_mismatch')
     if len(signature['endpoints']) != 2:
         raise ContractError('two_candidate_endpoints_required')
@@ -76,6 +77,10 @@ def read_cohort(path):
     return {text(value) for value in raw}
 
 
+def endpoint_key_for_identity(ep):
+    return (ep['electrode_id'], ep['role'], ep['actual_layer'])
+
+
 def search(query, index, cohort, *, topk, expand=False):
     validate_record(query); validate_index(index)
     if not isinstance(cohort, (set, list, tuple)) or not cohort:
@@ -84,19 +89,22 @@ def search(query, index, cohort, *, topk, expand=False):
     if type(topk) is not int or topk < 1:
         raise ContractError('positive_topk_required')
     primary, supplementary, rejected = [], [], []
+    from .index import compatibility_signature
     for candidate in index['records']:
-        if candidate['roi_id'] == query['roi_id'] and candidate['source_identity'] == query['source_identity']:
-            rejected.append({'roi_id': candidate['roi_id'], 'reason': 'query_itself_excluded'}); continue
-        if candidate['case_signature'] != query['case_signature']:
-            rejected.append({'roi_id': candidate['roi_id'], 'reason': 'case_or_CNT_binding_incompatible'}); continue
         in_primary = candidate['product_id'] in cohort
         if not in_primary and not expand:
             continue
+        if candidate['roi_id'] == query['roi_id'] and candidate['source_identity'] == query['source_identity']:
+            rejected.append({'roi_id': candidate['roi_id'], 'reason': 'query_itself_excluded'}); continue
+        if compatibility_signature(candidate['case_signature']) != compatibility_signature(query['case_signature']):
+            rejected.append({'roi_id': candidate['roi_id'], 'reason': 'case_or_CNT_binding_incompatible'}); continue
         same_location = (candidate['source_identity'] == query['source_identity']
                          and candidate['frame'] == query['frame']
                          and candidate['center_xy_um'] == query['center_xy_um']
                          and candidate['source_version'] == query['source_version']
-                         and candidate['source_assets'] == query['source_assets'])
+                         and candidate['source_assets'] == query['source_assets']
+                         and sorted(map(endpoint_key_for_identity, candidate['case_signature']['endpoints']))
+                             == sorted(map(endpoint_key_for_identity, query['case_signature']['endpoints'])))
         result = {key: deepcopy(value) for key, value in candidate.items() if key != 'embedding'}
         result.update(score=cosine(query['embedding'], candidate['embedding']),
                       search_scope='primary' if in_primary else 'supplementary',
@@ -114,6 +122,7 @@ def search(query, index, cohort, *, topk, expand=False):
             'status': status, 'no_match_reasons': reasons, 'primary': primary[:topk],
             'supplementary': supplementary[:topk] if expand else [], 'rejected': rejected,
             'primary_cohort': sorted(cohort), 'expanded': bool(expand),
+            'index_roi_ids': [r['roi_id'] for r in index['records']],
             'interpretation': 'similarity_only_not_registration_cause_or_risk'}
 
 
@@ -124,13 +133,15 @@ def main(argv=None):
     parser.add_argument('--index', required=True, type=Path); parser.add_argument('--cohort', required=True, type=Path)
     parser.add_argument('--topk', required=True, type=int); parser.add_argument('--expand', action='store_true')
     parser.add_argument('--out', required=True, type=Path)
+    parser.add_argument('--allow-unversioned-producer', action='store_true')
     args = parser.parse_args(argv)
     try:
         import torch
         from .checkpoint import fingerprint
         from .data import load_export
         from .index import candidate_record, load_encoder, view_config_dict
-        imported = load_export(args.export, assets_root=args.assets_root)
+        imported = load_export(args.export, assets_root=args.assets_root,
+                             allow_unversioned_producer=args.allow_unversioned_producer)
         rois = [r for r in imported.ready if r.row['roi_id'] == args.roi_id]
         if len(rois) != 1:
             raise ContractError('one_ready_query_roi_required')

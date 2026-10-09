@@ -171,7 +171,7 @@ def _ready(row, root, versions):
     return ROI(deepcopy(row), frame, channels, channel_bindings, deepcopy(versions))
 
 
-def load_export(path, *, assets_root=None, expected_producer_commit=None):
+def load_export(path, *, assets_root=None, expected_producer_commit=None, allow_unversioned_producer=False):
     """Invalid ready rows become blocked; envelope errors reject the export.
 
     assets_root explicitly relocates the unchanged producer references. Without it,
@@ -182,12 +182,18 @@ def load_export(path, *, assets_root=None, expected_producer_commit=None):
     if payload.get('schema_version') != SCHEMA_VERSION:
         raise ContractError('unknown_schema_version')
     commit = payload.get('producer_commit')
-    if not isinstance(commit, str) or not re.fullmatch('[0-9a-f]{40}', commit):
+    unversioned = commit is None
+    if unversioned:
+        if allow_unversioned_producer is not True or not isinstance(payload.get('producer_commit_reason'), str) or not payload['producer_commit_reason'].strip():
+            raise ContractError('producer_commit_required')
+    elif not isinstance(commit, str) or not re.fullmatch('[0-9a-f]{40}', commit):
         raise ContractError('producer_commit_required')
     if expected_producer_commit is not None and commit != expected_producer_commit:
         raise ContractError('producer_commit_mismatch')
     versions = {'schema_version': SCHEMA_VERSION, 'producer_commit': commit,
-                'source_manifest_hash': _hash(payload['source_manifest_hash'])}
+                'source_manifest_hash': _hash(payload['source_manifest_hash']),
+                'unversioned_producer_accepted': unversioned,
+                'producer_commit_reason': payload.get('producer_commit_reason')}
     if payload.get('tensor_input_policy') != 'original_layout_CNT_VIA_valid_only':
         raise ContractError('unsupported_tensor_input_policy')
     if assets_root is not None:
@@ -242,10 +248,12 @@ def main(argv=None):
     parser.add_argument('export', type=Path)
     parser.add_argument('--assets-root', type=Path, help='Explicit relocation root for original referenced assets')
     parser.add_argument('--expected-producer-commit', help='Require this exact producer revision')
+    parser.add_argument('--allow-unversioned-producer', action='store_true', help='Explicitly accept a null producer commit with a declared reason')
     args = parser.parse_args(argv)
     try:
         result = load_export(args.export, assets_root=args.assets_root,
-                             expected_producer_commit=args.expected_producer_commit)
+                             expected_producer_commit=args.expected_producer_commit,
+                             allow_unversioned_producer=args.allow_unversioned_producer)
         print(json.dumps(result.summary(), allow_nan=False))
         return 3 if result.blocked or result.excluded_records else 0
     except (ContractError, KeyError, TypeError, ValueError, OSError) as exc:

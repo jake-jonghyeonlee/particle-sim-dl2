@@ -27,7 +27,9 @@ rows. The export is unchanged; `--assets-root` explicitly relocates its copied
 references. No runtime import from the producer or DL1 is used.
 
 Both window sizes in µm and an explicit versioned intermediate-layer policy are
-required. There are no package defaults. Load a caller-supplied recipe as follows:
+required. Neither sizes nor policies have defaults; low-level source-pitch/nearest
+compatibility defaults are specified in docs/training.md and never change the
+explicit physical window extent. Load a caller-supplied recipe as follows:
 
 ```python
 import json
@@ -54,7 +56,8 @@ independent candidate review and exchange integration T12 remain pending.
 
 
 T11 requires explicit real-run windows, both view pitches/resampling modes,
-physical jitter/common core and a versioned intermediate-layer policy. Search
+physical jitter/common core, a versioned intermediate-layer policy and explicit
+`common_core_connectivity_v2` topology policy. Search
 requires an explicit DL1 cohort file; optional correspondence labels never block
 label-free training. G4, G6 and real performance acceptance remain pending.
 Examples under `configs/` are marked synthetic and are not recommendations.
@@ -86,3 +89,22 @@ DL crops, and the regularisers are not claimed to remove false negatives.
 
 Resume may extend the total epoch target while retaining the model/data/view/loss
 fingerprint. Changes to semantic configuration remain incompatible.
+
+
+R4 fixes use exact rational crop boundaries (ties take the higher source cell) and
+compare observed core connectivity, so long electrodes and jitter crossing native
+cells are supported. Identical near/wide pairs are explicitly marked in metadata.
+See [R4 finding status and regression evidence](docs/review/R4_FIXES.md).
+
+Producer revision validation defaults to hexadecimal-format checking; use
+`--expected-producer-commit` on validation to pin an approved revision. A null
+revision fails unless `--allow-unversioned-producer` is explicitly chosen, and
+that acceptance/reason is recorded. The closed-network procedure is in
+[the data contract](docs/data_contract.md).
+
+Search case matching ignores electrode names/order and preserves original names
+in output; scores are rounded before sorting, so very close values can tie by ID.
+Evaluation requires `--split` and `--partition`, excludes other query partitions
+and separately reports known positives absent from the index. Low-level defaults,
+coarse merging limits, zero/sub-cell jitter equality and caller-owned lineage
+mapping are detailed in [training.md](docs/training.md).

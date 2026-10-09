@@ -26,6 +26,12 @@ def case_signature(metadata):
             'via_count': len(metadata['connections']['via_assets'])}
 
 
+def compatibility_signature(signature):
+    return (signature['failure_type'],
+            tuple(sorted((ep['role'], ep['actual_layer']) for ep in signature['endpoints'])),
+            ('CNT', 'VIA') if signature['via_count'] else ('CNT',))
+
+
 def candidate_record(bundle, embedding):
     metadata = bundle.metadata
     return {'roi_id': metadata['roi_id'], 'product_id': metadata['source_identity']['product_id'],
@@ -35,6 +41,7 @@ def candidate_record(bundle, embedding):
             'source_version': metadata['source_version'], 'source_versions': deepcopy(metadata['versions']),
             'source_assets': deepcopy(metadata['source_assets']),
             'case_signature': case_signature(metadata),
+            'topology_policy': metadata['topology_policy'],
             'valid_coverage': {'near': deepcopy(bundle.near.metadata['valid_coverage']),
                                'wide': deepcopy(bundle.wide.metadata['valid_coverage'])},
             'crop_geometry': {'near': deepcopy(bundle.near.metadata), 'wide': deepcopy(bundle.wide.metadata)},
@@ -81,16 +88,20 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description='Build an offline original-ROI embedding index with local weights.')
     parser.add_argument('export', type=Path); parser.add_argument('--assets-root', type=Path)
     parser.add_argument('--checkpoint', required=True, type=Path); parser.add_argument('--out', required=True, type=Path)
+    parser.add_argument('--allow-unversioned-producer', action='store_true')
     args = parser.parse_args(argv)
     try:
-        export = load_export(args.export, assets_root=args.assets_root)
+        export = load_export(args.export, assets_root=args.assets_root,
+                             allow_unversioned_producer=args.allow_unversioned_producer)
         model, views, fp = load_encoder(args.checkpoint)
         result = build_index(export.ready, model, views, fp)
+        result['producer_versions'] = export.versions
         result['blocked_export_records'] = [dict(roi_id=r['roi_id'], reasons=r['reasons']) for r in export.blocked]
         args.out.parent.mkdir(parents=True, exist_ok=True)
         args.out.write_text(json.dumps(result, allow_nan=False, indent=2))
         print(json.dumps({'n_indexed': len(result['records']), 'n_rejected': len(result['rejected']),
-                          'n_blocked': len(export.blocked), 'checkpoint_fingerprint': fp}))
+                          'n_blocked': len(export.blocked), 'checkpoint_fingerprint': fp,
+                          'unversioned_producer_accepted': export.versions['unversioned_producer_accepted']}))
         return 0 if result['records'] else 3
     except (ContractError, KeyError, ValueError, TypeError, OSError) as exc:
         print(json.dumps({'error': str(exc)}), file=sys.stderr); return 2
