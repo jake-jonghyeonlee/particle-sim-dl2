@@ -1,0 +1,7 @@
+{
+  "schema_version": "roi_relations_v1",
+  "relations": [
+    {"a": "synthetic_roi_A", "b": "synthetic_roi_B", "relation": "similar"},
+    {"a": "synthetic_roi_A", "b": "synthetic_roi_C", "relation": "unknown"}
+  ]
+}

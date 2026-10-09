@@ -50,3 +50,20 @@ def source(tmp_path):
         path.write_text(json.dumps(payload))
         return path
     return payload, write, tmp_path
+
+
+def pytest_addoption(parser):
+    parser.addoption('--run-training', action='store_true', default=False,
+                     help='Opt into the multi-epoch synthetic train/resume/index/search/evaluate smoke')
+
+
+def pytest_configure(config):
+    config.addinivalue_line('markers', 'training: opt-in multi-epoch synthetic optimisation')
+
+
+def pytest_collection_modifyitems(config, items):
+    if not config.getoption('--run-training'):
+        for item in items:
+            if item.get_closest_marker('training'):
+                item.add_marker(pytest.mark.skip(
+                    reason='multi-epoch synthetic training requires explicit --run-training'))

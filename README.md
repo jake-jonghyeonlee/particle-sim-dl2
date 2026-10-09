@@ -2,8 +2,10 @@
 
 T10 provides offline `review_roi_v1` validation and original multi-layer near/wide
 ROI bundles. It preserves physical coordinates, endpoint roles and actual layers,
-CNT/VIA masks, valid coverage and source versions. It has no model, loss, training
-or search implementation yet (T11).
+CNT/VIA masks, valid coverage and source versions. T11 adds a small encoder with
+role/layer conditioning, set aggregation and label-free paired-view
+training with alignment/variance/covariance regularisation, optional correspondence
+labels, safe splits, resumable local checkpoints, cohort search and evaluation.
 
 Use Python 3.12. Runtime/test pins match the existing DL1 environment where shared.
 Torch is installed for T11; T10 uses NumPy and Pillow only.
@@ -38,7 +40,7 @@ export = load_export("review_rois.json", assets_root="original_assets")
 bundle = build_bundle(export.ready[0], recipe)
 ```
 
-The only example sizes are in tests and the clearly synthetic
+T10 example sizes are in tests and the clearly synthetic
 [example config](tests/fixtures/synthetic_crop_config.json). Real window sizes and
 the intermediate-layer decision remain pending user configuration. See
 [the data contract](docs/data_contract.md) for sampling, policy and observation rules.
@@ -48,4 +50,39 @@ the intermediate-layer decision remain pending user configuration. See
 ```
 
 All tests block socket connections. Validation is synthetic; real-data acceptance,
-the independent coordinator review, T11 and exchange integration T12 remain pending.
+independent candidate review and exchange integration T12 remain pending.
+
+
+T11 requires explicit real-run windows, both view pitches/resampling modes,
+physical jitter/common core and a versioned intermediate-layer policy. Search
+requires an explicit DL1 cohort file; optional correspondence labels never block
+label-free training. G4, G6 and real performance acceptance remain pending.
+Examples under `configs/` are marked synthetic and are not recommendations.
+
+See [training and CLI instructions](docs/training.md) and
+[validation evidence](docs/validation.md). These CLIs work offline:
+
+```sh
+.venv/bin/python -m psdl2.train --help
+.venv/bin/python -m psdl2.index --help
+.venv/bin/python -m psdl2.search --help
+.venv/bin/python -m psdl2.evaluate --help
+.venv/bin/python -m pytest -p no:warnings
+```
+
+Default tests include forward/loss/gradient and recovery checks plus one bounded
+synthetic optimiser step. The full synthetic train/resume/index/search/evaluate
+chain requires `--run-training`; no real training or performance measurement was run. Search
+keeps cohort-only `primary` results separate from optional `supplementary`
+results; unavailable candidates never become risk zero. Embedding similarity is
+not spatial registration or evidence of cause. Quantitative CA remains outside
+DL crops, and the regularisers are not claimed to remove false negatives.
+
+
+```sh
+# Full synthetic execution smoke, without labels or ranking-quality assertions:
+.venv/bin/python -m pytest -p no:warnings --run-training
+```
+
+Resume may extend the total epoch target while retaining the model/data/view/loss
+fingerprint. Changes to semantic configuration remain incompatible.

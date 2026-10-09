@@ -35,7 +35,7 @@ def _count(size, pitch):
     return rounded
 
 
-def _patch(roi, size, pitch):
+def _patch(roi, size, pitch, resampling_mode='nearest'):
     width, height = (_count(s, pitch) for s in size)
     cx, cy = roi.center_xy_um
     origin = (cx - size[0] / 2, cy - size[1] / 2)
@@ -55,14 +55,34 @@ def _patch(roi, size, pitch):
     for key, mask in roi.channels.items():
         channels[key] = np.where(inside, mask[np.ix_(clipped_y, clipped_x)], 0).astype(np.uint8)
         channels[key].flags.writeable = False
-    valid_count = int(channels['valid'].sum())
+    if resampling_mode == 'area_coverage':
+        if pitch < source.pixel_pitch_um:
+            raise ContractError('area_coverage_requires_coarser_or_equal_pitch')
+        def overlap_weights(output_origin, count, source_origin, source_count):
+            starts = output_origin + np.arange(count) * pitch
+            source_starts = source_origin + np.arange(source_count) * source.pixel_pitch_um
+            return np.maximum(0, np.minimum(starts[:, None] + pitch,
+                              source_starts[None, :] + source.pixel_pitch_um)
+                              - np.maximum(starts[:, None], source_starts[None, :])) / pitch
+        wx = overlap_weights(origin[0], width, source.origin_xy_um[0], source.shape_yx[1])
+        wy = overlap_weights(origin[1], height, source.origin_xy_um[1], source.shape_yx[0])
+        for key, mask in roi.channels.items():
+            channels[key] = (wy @ mask.astype(np.float64) @ wx.T).clip(0, 1).astype(np.float32)
+            channels[key].flags.writeable = False
+        inside_fraction = wy.sum(axis=1)[:, None] * wx.sum(axis=1)[None, :]
+        valid_count = float(channels['valid'].sum(dtype=np.float64))
+    elif resampling_mode == 'nearest':
+        valid_count = int(channels['valid'].sum())
+    else:
+        raise ContractError('unknown_resampling_mode')
     meta = {
         'center_xy_um': [cx, cy], 'size_xy_um': list(size),
         'bbox_xyxy_um': [*origin, origin[0] + size[0], origin[1] + size[1]],
         'shape_yx': [height, width], 'output_pitch_um': pitch,
         'source_pitch_um': source.pixel_pitch_um,
         'native_size_xy_px': [s / source.pixel_pitch_um for s in size],
-        'transform_version': 'physical_cell_centres_nearest_v1',
+        'transform_version': ('physical_cell_area_coverage_v1' if resampling_mode == 'area_coverage'
+                              else 'physical_cell_centres_nearest_v1'),
         'transform': {'origin_xy_um': list(origin), 'pixel_pitch_um': pitch,
                       'axis_order': 'yx', 'origin_convention': 'top_left_cell_edge',
                       'source_origin_xy_um': list(source.origin_xy_um)},
@@ -76,10 +96,15 @@ def _patch(roi, size, pitch):
                            'observed_invalid_cells': int(inside.sum()) - valid_count},
         'quantitative_CA_permitted': False,
     }
+    if resampling_mode == 'area_coverage':
+        meta['valid_coverage']['outside_frame_cells'] = float((1 - inside_fraction).sum())
+        meta['valid_coverage']['observed_invalid_cells'] = max(0.0, float(inside_fraction.sum()) - valid_count)
+        meta['valid_coverage']['counts_meaning'] = 'fractional_output_cell_coverage'
     return Patch(channels, grid, meta)
 
 
-def build_bundle(roi, config):
+def build_bundle(roi, config, *, near_output_pitch_um=None, wide_output_pitch_um=None,
+                 near_resampling_mode='nearest', wide_resampling_mode='nearest'):
     """One admitted ROI produces both patches; blocked dictionaries are rejected.
 
     Intermediate policy preserves all exported original layers, or additionally
@@ -108,5 +133,10 @@ def build_bundle(roi, config):
         'crop_config': asdict(config), 'intermediate_layer_policy': config.intermediate_layer_policy,
         'retained_actual_layers': sorted(layers),
     }
-    return Bundle(_patch(roi, config.near_size_xy_um, pitch),
-                  _patch(roi, config.wide_size_xy_um, pitch), metadata)
+    from .schema import number
+    near_pitch = pitch if near_output_pitch_um is None else number(near_output_pitch_um, positive=True)
+    wide_pitch = pitch if wide_output_pitch_um is None else number(wide_output_pitch_um, positive=True)
+    metadata['view_sampling'] = {'near_pitch_um': near_pitch, 'wide_pitch_um': wide_pitch,
+                                 'near_mode': near_resampling_mode, 'wide_mode': wide_resampling_mode}
+    return Bundle(_patch(roi, config.near_size_xy_um, near_pitch, near_resampling_mode),
+                  _patch(roi, config.wide_size_xy_um, wide_pitch, wide_resampling_mode), metadata)
