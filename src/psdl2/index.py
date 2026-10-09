@@ -13,7 +13,7 @@ from .model import Encoder, ModelConfig
 from .schema import ContractError
 from .views import ViewConfig
 
-INDEX_SCHEMA = 'psdl2_index_v1'
+INDEX_SCHEMA = 'psdl2_index_v2'
 
 
 def case_signature(metadata):
@@ -42,6 +42,8 @@ def candidate_record(bundle, embedding):
             'source_assets': deepcopy(metadata['source_assets']),
             'case_signature': case_signature(metadata),
             'topology_policy': metadata['topology_policy'],
+            'connection_semantics': metadata['connection_semantics'],
+            'comparison_basis': metadata['comparison_basis'],
             'valid_coverage': {'near': deepcopy(bundle.near.metadata['valid_coverage']),
                                'wide': deepcopy(bundle.wide.metadata['valid_coverage'])},
             'crop_geometry': {'near': deepcopy(bundle.near.metadata), 'wide': deepcopy(bundle.wide.metadata)},
@@ -73,6 +75,9 @@ def build_index(rois, model, view_config, checkpoint_fingerprint):
                 rejected.append({'roi_id': roi.row['roi_id'], 'reason': str(exc)})
     result = {'schema_version': INDEX_SCHEMA, 'checkpoint_fingerprint': checkpoint_fingerprint,
               'view_fingerprint': fingerprint(view_config_dict(view_config)),
+              'topology_policy': view_config.topology_policy,
+              'connection_semantics': view_config.connection_semantics,
+              'comparison_basis': view_config.comparison_basis,
               'records': sorted(records, key=lambda r: r['roi_id']), 'rejected': rejected}
     from .search import validate_index
     validate_index(result)

@@ -10,9 +10,9 @@ from psdl2.schema import ContractError, CropConfig
 from psdl2.views import ViewConfig, generate_pair, validate_pair
 
 
-def view_config(*, jitter=(.1, .1), near=(3, 3), wide=(4, 4), near_pitch=.5, wide_pitch=1):
+def view_config(*, jitter=(.1, .1), near=(3, 3), wide=(4, 4), near_pitch=.5, wide_pitch=.5):
     return ViewConfig(CropConfig(near, wide, 'preserve_exported_layers_v1'),
-                      near_pitch, wide_pitch, 'nearest', 'area_coverage', jitter, (2, 2), 'common_core_connectivity_v2')
+                      near_pitch, wide_pitch, 'nearest', 'nearest' if wide_pitch == .5 else 'area_coverage', jitter, (2, 2), 'common_core_connectivity_v3', 'global_contact_proxy_unverified', 'between_views_only', 3)
 
 
 def test_label_free_jitter_has_one_transform_for_all_layers(source):
@@ -23,9 +23,9 @@ def test_label_free_jitter_has_one_transform_for_all_layers(source):
     assert first.metadata['roi_id'] == second.metadata['roi_id']
     assert first.metadata['center_xy_um'] != second.metadata['center_xy_um']
     for bundle in (first, second):
-        assert bundle.near.grid.shape_yx == (6, 6) and bundle.wide.grid.shape_yx == (4, 4)
+        assert bundle.near.grid.shape_yx == (6, 6) and bundle.wide.grid.shape_yx == (8, 8)
         assert bundle.near.metadata['transform_version'] == 'physical_cell_centres_nearest_exact_v2'
-        assert bundle.wide.metadata['transform_version'] == 'physical_cell_area_coverage_exact_v2'
+        assert bundle.wide.metadata['transform_version'] == 'physical_cell_centres_nearest_exact_v2'
         assert len({a.shape for a in bundle.near.channels.values()}) == 1
         assert len({a.shape for a in bundle.wide.channels.values()}) == 1
 
@@ -54,7 +54,7 @@ def test_area_coverage_thin_line_oracle_and_valid(source):
     assert not nearest.near.channels['layout:0'].any()
 
 
-def test_bridge_removed_rejected_even_same_center(source):
+def test_core_content_removed_rejected_even_same_center(source):
     _, write, _ = source; roi = load_export(write()).ready[0]
     channels = dict(roi.channels)
     bridge = np.zeros((8, 8), np.uint8); bridge[3, 1:7] = 1
@@ -65,8 +65,8 @@ def test_bridge_removed_rejected_even_same_center(source):
     modified['layout:0'] = a
     second = replace(second, near=replace(second.near, channels=modified))
     assert first.metadata['center_xy_um'] == second.metadata['center_xy_um']
-    with pytest.raises(ContractError, match='core_marked_content|core_connection'):
-        validate_pair(roi, first, second, (2, 2), 'common_core_connectivity_v2')
+    with pytest.raises(ContractError, match='^core_marked_content_changed$'):
+        validate_pair(roi, first, second, (2, 2), 'common_core_connectivity_v3')
 
 
 def test_frame_crossing_line_accepted_and_different_location_rejected(source):
@@ -78,7 +78,7 @@ def test_frame_crossing_line_accepted_and_different_location_rejected(source):
     first, second, _ = generate_pair(roi, view_config(), np.random.default_rng(1))
     metadata = deepcopy(second.metadata); metadata['roi_id'] = 'different_location'
     with pytest.raises(ContractError, match='share_original_location'):
-        validate_pair(roi, first, replace(second, metadata=metadata), (2, 2), 'common_core_connectivity_v2')
+        validate_pair(roi, first, replace(second, metadata=metadata), (2, 2), 'common_core_connectivity_v3')
 
 
 def test_invalid_common_core_and_missing_parameters(source):
@@ -94,13 +94,13 @@ def test_invalid_common_core_and_missing_parameters(source):
             ViewConfig.from_dict(raw)
 
 
-def test_nearest_resampling_loss_of_native_bridge_rejected(source):
+def test_coarse_nearest_is_configuration_error(source):
     _, write, _ = source; roi = load_export(write()).ready[0]
     channels = dict(roi.channels); line = np.zeros((8, 8), np.uint8); line[2, 2:6] = 1
     channels['layout:0'] = line; roi = replace(roi, channels=channels)
-    cfg = replace(view_config(jitter=(0, 0), near=(4, 4), wide=(4, 4), near_pitch=1, wide_pitch=1),
+    cfg = replace(view_config(jitter=(0, 0), near=(4, 4), wide=(4, 4), near_pitch=1, wide_pitch=.5),
                   near_resampling_mode='nearest')
-    with pytest.raises(ContractError, match='core_marked_content|core_connection'):
+    with pytest.raises(ContractError, match='coarse_nearest_not_supported_for_views'):
         generate_pair(roi, cfg, np.random.default_rng(1))
 
 
@@ -112,7 +112,7 @@ def test_unconnected_component_outside_core_may_leave_view(source):
                                      np.random.default_rng(0))
     changed = dict(second.near.channels); mask = changed['layout:0'].copy(); mask[1, 1] = 0
     changed['layout:0'] = mask; second = replace(second, near=replace(second.near, channels=changed))
-    assert validate_pair(roi, first, second, (2, 2), 'common_core_connectivity_v2')['status'] == 'accepted'
+    assert validate_pair(roi, first, second, (2, 2), 'common_core_connectivity_v3')['status'] == 'accepted'
 
 
 def test_fake_original_center_is_rejected(source):
@@ -120,4 +120,4 @@ def test_fake_original_center_is_rejected(source):
     first, second, _ = generate_pair(roi, view_config(), np.random.default_rng(0))
     metadata = deepcopy(second.metadata); metadata['original_center_xy_um'] = [101, 201]
     with pytest.raises(ContractError, match='original_physical_center'):
-        validate_pair(roi, first, replace(second, metadata=metadata), (2, 2), 'common_core_connectivity_v2')
+        validate_pair(roi, first, replace(second, metadata=metadata), (2, 2), 'common_core_connectivity_v3')

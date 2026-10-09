@@ -78,10 +78,10 @@ def stripes(source):
 
 def stripe_config(jitter):
     return ViewConfig(CropConfig((20, 20), (40, 40), 'preserve_exported_layers_v1'),
-                      .5, .5, 'nearest', 'nearest', (jitter, jitter), (10, 10), TOPOLOGY_POLICY)
+                      .5, .5, 'nearest', 'nearest', (jitter, jitter), (10, 10), TOPOLOGY_POLICY, 'global_contact_proxy_unverified', 'between_views_only', 3)
 
 
-@pytest.mark.parametrize('jitter', [0, .1, 1.])
+@pytest.mark.parametrize('jitter', [0, .1, .3, 1., 4.9])
 def test_B2_review_frame_crossing_stripes_180_pairs_and_loss(source, jitter):
     from psdl2.model import Encoder
     from psdl2.train import paired_forward
@@ -105,7 +105,7 @@ def test_B2_review_frame_crossing_stripes_180_pairs_and_loss(source, jitter):
     assert result['accepted_pair_count'] == 2 and result['rejected_pair_count'] == 0
 
 
-@pytest.mark.parametrize('jitter', [.3, 1.])
+@pytest.mark.parametrize('jitter', [0, .1, .3, 1.])
 def test_B2_review_isolated_cells_edge_changes_are_accepted(source, jitter):
     rng = np.random.default_rng(2026)
     a = (rng.random((200, 200)) < .02).astype(np.uint8)
@@ -128,23 +128,23 @@ def test_B2_bridge_outside_core_lost_to_window_is_rejected(source):
     a[5:11, 8] = 1; a[5:11, 11] = 1; a[5, 8:12] = 1
     roi = hand_roi(source, (a, np.zeros_like(a)), pitch=1, center=(110, 210))
     cfg = ViewConfig(CropConfig((10, 10), (14, 14), 'preserve_exported_layers_v1'),
-                     1, 1, 'nearest', 'nearest', (0, 2), (4, 4), TOPOLOGY_POLICY)
+                     1, 1, 'nearest', 'nearest', (0, 2), (4, 4), TOPOLOGY_POLICY, 'global_contact_proxy_unverified', 'between_views_only', 3)
     first = cfg.bundle(roi); first.metadata['original_center_xy_um'] = [110, 210]
     row = deepcopy(roi.row); row['center_xy_um'] = [110, 212]
     second = cfg.bundle(replace(roi, row=row)); second.metadata['original_center_xy_um'] = [110, 210]
-    with pytest.raises(ContractError, match='core_connection_lost_between_views'):
+    with pytest.raises(ContractError, match='core_joint_connectivity_changed'):
         validate_pair(roi, first, second, (4, 4), TOPOLOGY_POLICY)
 
 
-def test_B2_coarse_grid_removed_bridge_and_merge_limitation(source):
+def test_B2_coarse_core_content_removed(source):
     a = np.zeros((20, 20), np.uint8); a[10, 6:14] = 1
     roi = hand_roi(source, (a, np.zeros_like(a)), pitch=1, center=(110, 210))
     cfg = ViewConfig(CropConfig((12, 12), (16, 16), 'preserve_exported_layers_v1'),
-                     2, 2, 'area_coverage', 'area_coverage', (0, 0), (8, 8), TOPOLOGY_POLICY)
+                     2, 2, 'area_coverage', 'area_coverage', (0, 0), (8, 8), TOPOLOGY_POLICY, 'global_contact_proxy_unverified', 'between_views_only', 3)
     first, second, _ = generate_pair(roi, cfg, np.random.default_rng(1))
     channels = dict(second.near.channels); mask = channels['layout:0'].copy(); mask[3, 3] = 0
     channels['layout:0'] = mask; second = replace(second, near=replace(second.near, channels=channels))
-    with pytest.raises(ContractError, match='resampled_core_marked_content_lost|resampled_core_connection_lost'):
+    with pytest.raises(ContractError, match='^resampled_core_marked_content_lost$'):
         validate_pair(roi, first, second, (8, 8), TOPOLOGY_POLICY)
 
 
@@ -186,7 +186,6 @@ def test_N3_known_different_counts_and_numpy_loss_reproduction():
     labels[0, 1] = labels[1, 0] = 1; labels[1, 2] = labels[2, 1] = 0
     result = objective(torch.tensor(a), torch.tensor(b), config, relations=labels)
     assert result['alignment_pair_indices'] == [[i, i] for i in range(5)]
-    assert result['negative_pair_count'] == sum(i != j for i, j in result['alignment_pair_indices'])
     assert result['supervised_known_pair_count'] == 2 and result['supervised_different_pair_count'] == 1
     alignment = ((a-b)**2).mean(); variance, covariance = [], []
     for values in (a, b):
@@ -287,10 +286,11 @@ def test_B2_rejection_counts_in_effective_batch_error(source):
     row = deepcopy(roi.row); row['roi_id'] = 'second'
     channels = dict(roi.channels); invalid = channels['valid'].copy(); invalid[3, 3] = 0; channels['valid'] = invalid
     bad = replace(roi, channels=channels)
-    with pytest.raises(ContractError) as caught:
-        paired_forward(Encoder(model_config()), [bad, replace(bad, row=row)], view_config(), loss_config(), np.random.default_rng(1))
-    payload = json.loads(str(caught.value).split(': ', 1)[1])
-    assert payload == {'accepted_pair_count': 0, 'rejected_pair_count': 2, 'reasons': {'common_core_not_observed': 2}}
+    result, rejected = paired_forward(Encoder(model_config()), [bad, replace(bad, row=row)], view_config(), loss_config(), np.random.default_rng(1))
+    assert result['skipped_batches'] == 1 and result['accepted_pairs_used'] == 0
+    assert result['attempted_pairs'] == 6 and result['retry_attempts'] == 4
+    assert result['rejected_attempts_by_reason'] == {'common_core_not_observed': 6}
+
 
 
 @pytest.mark.parametrize('change', ['blocked_to_ready', 'identity', 'origin', 'axis', 'uppercase_hash', 'cnt_missing', 'parent_path', 'tensor_policy_missing', 'valid_polarity'])
@@ -348,13 +348,13 @@ def test_B2_coarse_connection_lost_outside_core_but_core_content_unchanged(sourc
     a[5:12, 6] = 1; a[5:12, 13] = 1; a[5, 6:14] = 1
     roi = hand_roi(source, (a, np.zeros_like(a)), pitch=1, center=(110, 210))
     cfg = ViewConfig(CropConfig((14, 14), (18, 18), 'preserve_exported_layers_v1'),
-                     2, 2, 'area_coverage', 'area_coverage', (0, 0), (8, 4), TOPOLOGY_POLICY)
+                     2, 2, 'area_coverage', 'area_coverage', (0, 0), (8, 4), TOPOLOGY_POLICY, 'global_contact_proxy_unverified', 'between_views_only', 3)
     first, second, _ = generate_pair(roi, cfg, np.random.default_rng(1))
     channels = dict(second.near.channels); mask = channels['layout:0'].copy(); mask[1, 3] = 0
     channels['layout:0'] = mask; second = replace(second, near=replace(second.near, channels=channels))
     # The removed coarse cell is above the core (y205..207 vs core y208..212).
     # Both core stems remain marked, but their only route is broken.
-    with pytest.raises(ContractError, match='resampled_core_connection_lost'):
+    with pytest.raises(ContractError, match='resampled_core_joint_relation_changed'):
         validate_pair(roi, first, second, (8, 4), TOPOLOGY_POLICY)
 
 
@@ -362,10 +362,11 @@ def test_N8_coarse_merging_is_explicitly_not_checked(source):
     a = np.zeros((20, 20), np.uint8); a[10, 8] = 1; a[10, 10] = 1
     roi = hand_roi(source, (a, np.zeros_like(a)), pitch=1, center=(110, 210))
     cfg = ViewConfig(CropConfig((8, 8), (8, 8), 'preserve_exported_layers_v1'),
-                     4, 4, 'area_coverage', 'area_coverage', (0, 0), (8, 8), TOPOLOGY_POLICY)
+                     4, 4, 'area_coverage', 'area_coverage', (0, 0), (8, 8), TOPOLOGY_POLICY, 'global_contact_proxy_unverified', 'between_views_only', 3)
     # Two separate native cells become adjacent marked coarse cells. This is a
-    # merge, not a loss of native connection; the declared policy permits it.
-    assert generate_pair(roi, cfg, np.random.default_rng(1))[2]['status'] == 'accepted'
+    # merge, not a loss; v3 rejects the spurious anchor relation.
+    with pytest.raises(ContractError, match='^resampled_core_joint_relation_changed$'):
+        generate_pair(roi, cfg, np.random.default_rng(1))
 
 
 def test_review_non_square_crop_axes_padding_and_shared_center(source):

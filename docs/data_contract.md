@@ -135,3 +135,31 @@ Only declared asset kind/binding and bytes/hash can be validated. A file named
 `hotspot.npy` falsely declared as an original layout cannot be identified by
 filename or binary appearance; correct original-layout provenance remains the
 producer's responsibility. Hotspot/CA/Fab fields themselves are rejected.
+
+
+## V3 view graph and identity contract
+
+Training view policy is explicitly `common_core_connectivity_v3`, with required
+`connection_semantics=global_contact_proxy_unverified`,
+`comparison_basis=between_views_only`, and positive integer `max_pair_attempts`.
+These settings have no package defaults and bind checkpoint/view fingerprints.
+See [training.md](training.md) for exact graph edges, anchors, rejection reasons,
+recipe/frame preflight, bounded retries and skip counters. Core content is checked
+for every non-valid channel. Only the involved endpoint layouts, CNT and individual
+VIA channels form the graph. Intermediate layout layers retain their content and
+metadata but do not invent additional case endpoints.
+
+Global CNT and endpoint-free VIA can contact any involved layout at the same XY;
+no layer-specific endpoint limits can be justified by this export. The graph is
+an unverified geometry proxy, not actual net connectivity. Two jittered views are
+compared with each other, never with the un-jittered centre graph. Area views must
+preserve their own native joint partition, including separation of anchors.
+Fractional valid coverage remains fractional and only supplies observed support;
+every core source cell itself still requires full observation.
+
+Strict `same_physical_case` includes `analysis_layer`. Search compatibility uses
+unordered role/actual-layer endpoints, failure type and CNT/VIA presence and
+intentionally does not require the same analysis layer or VIA count. A missing
+`producer_commit` key remains equivalent to null: explicit unversioned opt-in,
+nonempty reason and any commit-pin checks still apply; no admission rule changed.
+Legacy v2-policy checkpoint/index inputs are rejected, with no automatic migration.

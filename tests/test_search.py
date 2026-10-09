@@ -25,8 +25,10 @@ def fixed_records(source):
 
 
 def make_index(records):
-    return {'schema_version': 'psdl2_index_v1', 'checkpoint_fingerprint': 'a'*64,
-            'view_fingerprint': 'b'*64, 'records': records, 'rejected': []}
+    return {'schema_version': 'psdl2_index_v2', 'checkpoint_fingerprint': 'a'*64,
+            'view_fingerprint': 'b'*64, 'records': records, 'rejected': [],
+            'topology_policy': 'common_core_connectivity_v3',
+            'connection_semantics': 'global_contact_proxy_unverified', 'comparison_basis': 'between_views_only'}
 
 
 def test_primary_cohort_is_unchanged_by_higher_supplementary_and_stable_ties(source):

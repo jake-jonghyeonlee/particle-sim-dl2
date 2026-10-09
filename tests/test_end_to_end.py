@@ -106,6 +106,10 @@ def test_opt_in_real_cli_train_resume_index_search_evaluate(tmp_path, capsys, re
     assert '--labels' not in args
     assert train_main(args) == 0
     initial = json.loads(capsys.readouterr().out)
+    assert initial['topology_policy'] == 'common_core_connectivity_v3'
+    assert initial['connection_semantics'] == 'global_contact_proxy_unverified'
+    assert initial['comparison_basis'] == 'between_views_only'
+    assert initial['max_pair_attempts'] == config['views']['max_pair_attempts']
     assert [entry['epoch'] for entry in initial['history']] == [1, 2]
     for entry in initial['history']:
         assert all(np.isfinite(entry[key]) for key in ('total', 'alignment', 'variance', 'covariance', 'supervised'))
@@ -132,9 +136,8 @@ def test_opt_in_real_cli_train_resume_index_search_evaluate(tmp_path, capsys, re
     assert continuous['model_fingerprint'] == raw['model_fingerprint']
     assert continuous['rng']['views'] == raw['rng']['views']
     torch.testing.assert_close(continuous['rng']['torch'], raw['rng']['torch'])
-    assert resumed['epoch_history'] == [
-        {'epoch': 3, 'accepted_pair_count': 2, 'rejected_pair_count': 0, 'rejection_reasons': {}},
-        {'epoch': 4, 'accepted_pair_count': 2, 'rejected_pair_count': 0, 'rejection_reasons': {}}]
+    assert resumed['epoch_history'] == continuous_result['epoch_history']
+    assert [entry['epoch'] for entry in resumed['epoch_history']] == [1, 2, 3, 4]
     assert all(row['accepted_pair_count'] == 2 and row['rejected_pair_count'] == 0
                for row in resumed['history'])
     before = checkpoint_path.read_bytes()

@@ -41,6 +41,11 @@ def validate_record(record):
         from .schema import number
         if not 0 < number(fraction) <= 1:
             raise ContractError('candidate_has_no_observed_coverage')
+    from .views import TOPOLOGY_POLICY, CONNECTION_SEMANTICS, COMPARISON_BASIS
+    if (record.get('topology_policy') != TOPOLOGY_POLICY or
+            record.get('connection_semantics') != CONNECTION_SEMANTICS or
+            record.get('comparison_basis') != COMPARISON_BASIS):
+        raise ContractError('incompatible_candidate_view_policy')
     signature = record['case_signature']
     if set(signature) != {'failure_type', 'analysis_layer', 'endpoints', 'connection_observation', 'cnt_binding', 'via_count'}:
         raise ContractError('complete_case_signature_required')
@@ -56,6 +61,11 @@ def validate_index(index):
     from .index import INDEX_SCHEMA
     if index['schema_version'] != INDEX_SCHEMA:
         raise ContractError('unknown_index_schema')
+    from .views import TOPOLOGY_POLICY, CONNECTION_SEMANTICS, COMPARISON_BASIS
+    if (index.get('topology_policy') != TOPOLOGY_POLICY or
+            index.get('connection_semantics') != CONNECTION_SEMANTICS or
+            index.get('comparison_basis') != COMPARISON_BASIS):
+        raise ContractError('incompatible_index_view_policy')
     for key in ('checkpoint_fingerprint', 'view_fingerprint'):
         value = index[key]
         if not isinstance(value, str) or len(value) != 64 or any(c not in '0123456789abcdef' for c in value):
@@ -103,6 +113,7 @@ def search(query, index, cohort, *, topk, expand=False):
                          and candidate['center_xy_um'] == query['center_xy_um']
                          and candidate['source_version'] == query['source_version']
                          and candidate['source_assets'] == query['source_assets']
+                         and candidate['case_signature']['analysis_layer'] == query['case_signature']['analysis_layer']
                          and sorted(map(endpoint_key_for_identity, candidate['case_signature']['endpoints']))
                              == sorted(map(endpoint_key_for_identity, query['case_signature']['endpoints'])))
         result = {key: deepcopy(value) for key, value in candidate.items() if key != 'embedding'}

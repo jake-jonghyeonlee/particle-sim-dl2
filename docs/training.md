@@ -34,7 +34,11 @@ and policies explicitly; the low-level compatibility defaults are listed below. 
   choice. Two independent uniform offsets are drawn about the original centre.
 - `core_size_xy_um`, the common observed core, fitting every possible near view.
 - Explicit versioned `intermediate_layer_policy`, plus any `required_layers`.
-- `topology_policy=common_core_connectivity_v2`; there is no implicit topology policy.
+- `topology_policy=common_core_connectivity_v3`,
+  `connection_semantics=global_contact_proxy_unverified`, and
+  `comparison_basis=between_views_only`; all three are required.
+- Positive integer `max_pair_attempts`, including the first attempt, with no
+  package default. The synthetic example's three attempts is not a recommendation.
 - Role/layer vocabularies, model dimensions, loss settings, batch size, learning
   rate, epoch count and seed.
 
@@ -48,32 +52,76 @@ before conversion of coverage weights to floating-point arrays. Every channel
 shares the index vectors/weights, and exact rational origins are recorded.
 Quantitative CA is never measured on these model representations.
 
-`generate_pair` calls T10 crops and records `common_core_connectivity_v2` in the
-config, checkpoint/view fingerprint and outputs. Source cells intersecting the
-physical common core must be observed in both windows, with identical marked
-core content. For each involved layout/CNT/VIA channel, 4-neighbour connectivity
-among core cells through the marked cells **inside each view's own window** must
-be identical between jitter views at the same scale. Long wires may continue
-beyond the window; remote clipped ends or disconnected components outside the
-core are not rejection reasons. A bridge outside the core that only one window
-retains changes the core relation and is rejected.
+`generate_pair` calls T10 crops and records the explicit v3 policy and semantics
+in config, checkpoint/view fingerprints and output records. The common core is
+fixed about the original centre. Every source cell with positive-area overlap
+with that half-open core must be observed and represented in both windows, with
+identical marked content for **every non-valid channel**, including CNT and VIA.
+Only marked involved-layout cells are graph anchors. An empty anchor set is
+`no_core_layout_anchor`, rather than an admissible all-empty positive.
 
-Native nearest output is mapped back by its exact source indices so modified or
-lost core/bridge pixels are checked. Coarse/area-coverage output additionally must
-keep every marked core anchor represented and preserve each native core
-connection on the sampled grid. Positive area fractions mean marked presence;
-source masks are never thresholded. Native core observation is checked exactly;
-coarse cells may have partial valid coverage due to an unknown area **outside**
-the core. That alone does not turn observed source core cells into missing data.
-Coarse merging of distinct native shapes is deliberately not checked, and these
-checks are not evidence of electrical connectivity or real performance.
+One joint graph uses 4-neighbour marked edges inside each layout/CNT/VIA channel.
+Cross-channel edges exist only at coincident XY between an involved layout and a
+CNT or VIA channel. There is no direct layout-layout, CNT-VIA or VIA-VIA edge.
+No layer-specific CNT/VIA endpoint binding is inferred. This is the explicitly
+unverified `global_contact_proxy_unverified` geometry assumption, not electrical
+continuity, real nets, physical layer connectivity or evidence of a short.
+Verified physical connectivity would need a new producer endpoint contract and
+user gate. Actual-layer/role/case identity remains separate context.
 
-`pair_acceptance.identical_views` reports near/wide array equality explicitly,
-including zero jitter or sub-cell offsets that leave nearest arrays unchanged.
-The synthetic config uses a jitter range capable of crossing a native cell;
-this is a test example, not a real-run recommendation. Every batch and completed
-epoch reports accepted/rejected counts and rejection reasons. Effective batches
-below two fail with those counts/reasons in the error text.
+The equivalence partition of core layout anchors through the window graph is
+compared near-to-near and wide-to-wide. Remote clipping and disconnected exterior
+components are allowed when the partition stays unchanged. A CNT/VIA bridge
+retained by only one view rejects with `core_joint_connectivity_changed`.
+**The un-jittered centre window is not a connectivity reference.** If both near
+views lose the same bridge and their near partitions agree, they are accepted;
+wide views independently need only agree with each other. This intentional
+`comparison_basis=between_views_only` limits what positive-pair acceptance proves.
+
+Native nearest uses actual patch pixels and exact source indices. Coarser views
+require `area_coverage`; coarse nearest fails with
+`coarse_nearest_not_supported_for_views`. Finer output pitches are unsupported for
+these training views. Each area view has its own native reference graph over
+source cells whose centres fall in its half-open window. Positive fractional
+coverage represents observed support, not full validity. Source core cells must
+all be fully observed, even when a coarse cell includes unobserved exterior area.
+Every marked non-valid core source cell must remain supported in its output
+channel. Missing support rejects with `resampled_core_marked_content_lost`.
+The sampled joint anchor partition must equal that view's native partition:
+both lost connections and spurious merges reject with
+`resampled_core_joint_relation_changed`. Different fractional weights between
+views are allowed if content support and partitions remain valid. This neither
+preserves quantitative CA nor establishes exact physical topology.
+
+`pair_acceptance.identical_views` records near/wide equality, including zero or
+sub-cell jitter. The synthetic recipe now uses native near/wide nearest grids:
+the old coarser recipe can create spurious anchor merges, which v3 correctly
+rejects. Dedicated synthetic tests and the benchmark still exercise area grids.
+No example specifies a real-run pitch or window recommendation.
+
+Training preflight combines each train ROI/frame with the recipe before optimizer
+construction. It checks integer output sizes, exact source-index bounds across
+the entire jitter range at both scales, and frame/source-valid coverage of the
+core. Core10.2/jitter4.9/near20 at source pitch .5 fails the index-bound check;
+aligned core10 with the same jitter passes. There is no blanket extra-cell margin.
+
+Only typed, named view rejections consume retries. Schema/identity/policy/file or
+recipe errors fail immediately. Retry only the failed ROI in the same RNG stream,
+preserve accepted pairs, and never duplicate a location to fill a batch. After
+`max_pair_attempts`, omit that ROI. Two or more distinct accepted locations permit
+one loss/optimizer step; smaller batches are skipped and later batches proceed.
+An epoch without any optimizer steps fails `no_usable_batch_in_epoch` with
+statistics and leaves the last completed checkpoint unchanged.
+
+Batch and epoch histories record `attempted_pairs`, `retry_attempts`,
+`rejected_attempts_by_reason`, `accepted_pairs_generated`, `accepted_pairs_used`,
+`skipped_batches`, and `optimizer_steps`. Generated includes accepted pairs that
+were discarded in a skipped batch; used does not. Legacy accepted/rejected counts
+are also retained per batch. Completed epoch histories and RNG states are saved,
+so continuation restores retry/skip order as well as optimizer state. CLI failure
+JSON includes a `statistics` object for unusable epochs. Policy, graph semantics
+and retry settings are fingerprinted. V2-policy checkpoints/indexes are rejected
+without migration; checkpoint and index container schemas are now v2.
 
 Low-level compatibility defaults: `CropConfig.output_pitch_um=None` uses source
 pitch; `required_layers=()` adds no layer requirement for the explicitly chosen
@@ -149,7 +197,7 @@ The following runs training only when the user explicitly invokes it:
 ```
 
 Only train-assigned rows are optimised. Rejected pairs are omitted and an effective
-batch below two fails explicitly. Final singleton batches are merged into the
+batch below two is skipped after bounded retries; only an epoch with no usable batch fails. Final singleton batches are merged into the
 previous batch. No real training was run while implementing this package, and
 the default suite has one explicitly bounded synthetic optimiser step. Multi-epoch
 training and the complete CLI chain run only with `pytest --run-training`.
@@ -188,7 +236,12 @@ cohort. The primary list contains only cohort and case-compatible candidates.
 Compatibility compares failure type, the unordered multiset of endpoint
 (role, actual_layer), and connection kind (CNT, with VIA when exported).
 Electrode names and endpoint order do not restrict cross-product matching;
-original IDs, analysis layer and full bindings remain visible in the output. It does not guess a pair from XY.
+original IDs, analysis layer and full bindings remain visible in the output.
+`same_physical_case` additionally requires the same analysis layer along with
+source/frame/centre/assets and full electrode identities. A different analysis
+layer can remain search-compatible without being the same physical case. VIA
+compatibility records presence, not VIA count or inferred endpoint binding.
+It does not guess a pair from XY.
 Coarser/finer transformations must share the checkpoint's view fingerprint.
 Expansion ranks outside-cohort compatible candidates only in `supplementary`,
 without changing primary membership or ordering. Scores are cosine in float64,

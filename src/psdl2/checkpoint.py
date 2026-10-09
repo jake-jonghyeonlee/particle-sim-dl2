@@ -11,7 +11,7 @@ import torch
 
 from .schema import ContractError
 
-CHECKPOINT_SCHEMA = 'psdl2_checkpoint_v1'
+CHECKPOINT_SCHEMA = 'psdl2_checkpoint_v2'
 
 
 def fingerprint(config):
@@ -45,12 +45,13 @@ def atomic_torch_save(payload, path):
             os.unlink(temporary)
 
 
-def save_checkpoint(path, model, optimizer, config, *, epoch, view_rng=None, target_epochs=None):
+def save_checkpoint(path, model, optimizer, config, *, epoch, view_rng=None, target_epochs=None, epoch_history=None):
     state = np.random.get_state()
     payload = {'schema_version': CHECKPOINT_SCHEMA, 'input_schema_version': 'original_roi_bundle_v1',
                'config': config, 'fingerprint': fingerprint(config), 'model': model.state_dict(),
                'model_fingerprint': model_fingerprint(model.state_dict()),
                'optimizer': optimizer.state_dict(), 'epoch': epoch, 'target_epochs': target_epochs,
+               'epoch_history': [] if epoch_history is None else epoch_history,
                'rng': {'python': random.getstate(), 'numpy': [state[0], state[1].tolist(), *state[2:]],
                        'torch': torch.get_rng_state(),
                        'cuda': torch.cuda.get_rng_state_all() if torch.cuda.is_available() else [],
@@ -63,6 +64,9 @@ def read_checkpoint(path, config):
     if (payload.get('schema_version') != CHECKPOINT_SCHEMA or
             payload.get('input_schema_version') != 'original_roi_bundle_v1'):
         raise ContractError('incompatible_checkpoint_schema')
+    if 'views' in payload['config']:
+        from .views import ViewConfig
+        ViewConfig.from_dict(payload['config']['views'])
     if payload.get('fingerprint') != fingerprint(config) or payload['fingerprint'] != fingerprint(payload['config']):
         raise ContractError('incompatible_config_fingerprint')
     if payload.get('model_fingerprint') != model_fingerprint(payload['model']):

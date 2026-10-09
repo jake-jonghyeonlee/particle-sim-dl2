@@ -15,7 +15,7 @@ from .losses import LossConfig, objective, read_labels, relation_matrix, validat
 from .model import Encoder, ModelConfig
 from .schema import ContractError, number
 from .split import record_for_roi, validate_split
-from .views import ViewConfig, generate_pair
+from .views import ViewConfig, ViewRejection, generate_pair, preflight, CONNECTION_SEMANTICS, COMPARISON_BASIS, REJECTION_REASONS
 
 
 def read_config(path):
@@ -32,22 +32,41 @@ def read_config(path):
     return config
 
 
+def _counters():
+    return dict(attempted_pairs=0, retry_attempts=0, rejected_attempts_by_reason={},
+                accepted_pairs_generated=0, accepted_pairs_used=0, skipped_batches=0, optimizer_steps=0)
+
+
 def paired_forward(model, rois, view_config, loss_config, rng, *, labels=None):
+    if len({r.row['roi_id'] for r in rois}) != len(rois):
+        raise ContractError('batch_requires_distinct_original_locations')
     first, second, ids, rejected = [], [], [], []
+    counts = _counters()
+    # Each location is visited once, retried only after a typed view rejection.
     for roi in rois:
-        try:
-            a, b, _ = generate_pair(roi, view_config, rng)
+        for attempt in range(view_config.max_pair_attempts):
+            counts['attempted_pairs'] += 1
+            counts['retry_attempts'] += int(attempt > 0)
+            try:
+                a, b, _ = generate_pair(roi, view_config, rng)
+            except ViewRejection as exc:
+                if str(exc) not in REJECTION_REASONS:
+                    raise ContractError('unknown_view_rejection_reason: '+str(exc)) from exc
+                rejected.append({'roi_id': roi.row['roi_id'], 'attempt': attempt+1, 'reason': str(exc)})
+                continue
             first.append(a); second.append(b); ids.append(roi.row['roi_id'])
-        except ContractError as exc:
-            rejected.append({'roi_id': roi.row['roi_id'], 'reason': str(exc)})
-    reason_counts = dict(Counter(row['reason'] for row in rejected))
+            break
+    reasons = dict(Counter(row['reason'] for row in rejected))
+    counts.update(rejected_attempts_by_reason=reasons, accepted_pairs_generated=len(first),
+                  accepted_pair_count=len(first), rejected_pair_count=len(rejected), rejection_reasons=reasons)
     if len(first) < 2:
-        raise ContractError('effective_batch_at_least_two_required_after_view_rejection: '+json.dumps(
-            {'accepted_pair_count': len(first), 'rejected_pair_count': len(rejected), 'reasons': reason_counts}, sort_keys=True))
+        counts['skipped_batches'] = 1
+        return counts, rejected
     z1 = model(first)['projection']; z2 = model(second)['projection']
     relations = None if labels is None else relation_matrix(labels, ids)
     losses = objective(z1, z2, loss_config, relations=relations)
-    losses.update(accepted_pair_count=len(first), rejected_pair_count=len(rejected), rejection_reasons=reason_counts)
+    counts['accepted_pairs_used'] = len(first)
+    losses.update(counts)
     return losses, rejected
 
 
@@ -60,6 +79,8 @@ def train(rois, config, output, *, lineages, assignments, labels=None, resume=No
     training = [r for r in rois if r.row['roi_id'] in split['train']]
     if len(training) < 2:
         raise ContractError('training_split_requires_two_locations')
+    for roi in training:
+        preflight(roi, view_config)
     # Fingerprint the exact data, split and optional supervision as well as the run config.
     # The requested total epoch budget controls how long to continue; it does not
     # change the model/data/objective or invalidate an otherwise compatible resume.
@@ -77,28 +98,48 @@ def train(rois, config, output, *, lineages, assignments, labels=None, resume=No
         if config['epochs'] <= epoch:
             raise ContractError('resume_target_epochs_must_exceed_saved_epoch')
     history, epoch_history = [], []
+    if resume is not None:
+        from .checkpoint import read_checkpoint
+        epoch_history = read_checkpoint(resume, accepted).get('epoch_history', [])
     for current in range(epoch, config['epochs']):
         order = rng.permutation(len(training)).tolist()
         batches = [order[i:i+config['batch_size']] for i in range(0, len(order), config['batch_size'])]
         if len(batches) > 1 and len(batches[-1]) == 1:
             batches[-2].extend(batches.pop())
         model.train()
-        epoch_accepted, epoch_rejected, epoch_reasons = 0, 0, Counter()
-        for batch in batches:
+        epoch_counts = _counters()
+        epoch_reasons = Counter()
+        epoch_batches = []
+        for batch_number, batch in enumerate(batches):
             optimizer.zero_grad(set_to_none=True)
             losses, rejected = paired_forward(model, [training[i] for i in batch], view_config,
                                                LossConfig(**config['loss']), rng, labels=labels)
-            losses['total'].backward(); optimizer.step()
-            epoch_accepted += losses['accepted_pair_count']; epoch_rejected += losses['rejected_pair_count']
-            epoch_reasons.update(losses['rejection_reasons'])
-            history.append({'epoch': current+1, 'rejected_views': rejected,
-                            **{key: float(value.detach()) if torch.is_tensor(value) else value
-                               for key, value in losses.items() if key != 'alignment_per_location'}})
-        epoch_history.append({'epoch': current+1, 'accepted_pair_count': epoch_accepted,
-                              'rejected_pair_count': epoch_rejected, 'rejection_reasons': dict(epoch_reasons)})
-        save_checkpoint(output, model, optimizer, accepted, epoch=current+1, view_rng=rng, target_epochs=config['epochs'])
+            if not losses['skipped_batches']:
+                losses['total'].backward(); optimizer.step()
+                losses['optimizer_steps'] = 1
+            for key in epoch_counts:
+                if key != 'rejected_attempts_by_reason':
+                    epoch_counts[key] += losses[key]
+            epoch_reasons.update(losses['rejected_attempts_by_reason'])
+            entry = {'epoch': current+1, 'batch': batch_number, 'roi_ids': [training[i].row['roi_id'] for i in batch],
+                     'rejected_views': rejected,
+                     **{key: float(value.detach()) if torch.is_tensor(value) else value
+                        for key, value in losses.items() if key != 'alignment_per_location'}}
+            history.append(entry); epoch_batches.append(entry)
+        epoch_counts['rejected_attempts_by_reason'] = dict(epoch_reasons)
+        epoch_entry = {'epoch': current+1, **epoch_counts, 'batches': epoch_batches}
+        if not epoch_counts['optimizer_steps']:
+            # Do not replace the last completed checkpoint with a failed epoch.
+            error = ContractError('no_usable_batch_in_epoch: '+json.dumps(epoch_entry, sort_keys=True))
+            error.statistics = epoch_entry
+            raise error
+        epoch_history.append(epoch_entry)
+        save_checkpoint(output, model, optimizer, accepted, epoch=current+1, view_rng=rng,
+                        target_epochs=config['epochs'], epoch_history=epoch_history)
     return {'status': 'completed', 'epochs': config['epochs'], 'config_fingerprint': fingerprint(accepted),
             'split': split, 'history': history, 'epoch_history': epoch_history,
+            'topology_policy': view_config.topology_policy, 'max_pair_attempts': view_config.max_pair_attempts,
+            'connection_semantics': CONNECTION_SEMANTICS, 'comparison_basis': COMPARISON_BASIS,
             'unversioned_producer_accepted': any(r.versions.get('unversioned_producer_accepted', False) for r in rois), 'performance_status': 'real_performance_pending'}
 
 
@@ -120,7 +161,7 @@ def main(argv=None):
                        labels=None if args.labels is None else read_labels(args.labels), resume=args.resume)
         print(json.dumps(result, allow_nan=False)); return 0
     except (ContractError, ValueError, KeyError, TypeError, OSError) as exc:
-        print(json.dumps({'error': str(exc)}), file=sys.stderr); return 2
+        print(json.dumps({'error': str(exc), **({'statistics': exc.statistics} if hasattr(exc, 'statistics') else {})}), file=sys.stderr); return 2
 
 
 if __name__ == '__main__':

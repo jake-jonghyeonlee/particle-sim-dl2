@@ -57,7 +57,9 @@ independent candidate review and exchange integration T12 remain pending.
 
 T11 requires explicit real-run windows, both view pitches/resampling modes,
 physical jitter/common core, a versioned intermediate-layer policy and explicit
-`common_core_connectivity_v2` topology policy. Search
+`common_core_connectivity_v3` topology policy, explicit
+`connection_semantics=global_contact_proxy_unverified`,
+`comparison_basis=between_views_only`, and positive `max_pair_attempts`. Search
 requires an explicit DL1 cohort file; optional correspondence labels never block
 label-free training. G4, G6 and real performance acceptance remain pending.
 Examples under `configs/` are marked synthetic and are not recommendations.
@@ -75,7 +77,7 @@ See [training and CLI instructions](docs/training.md) and
 
 Default tests include forward/loss/gradient and recovery checks plus one bounded
 synthetic optimiser step. The full synthetic train/resume/index/search/evaluate
-chain requires `--run-training`; no real training or performance measurement was run. Search
+chain requires `--run-training`; no real-data training or search-quality measurement was run. Search
 keeps cohort-only `primary` results separate from optional `supplementary`
 results; unavailable candidates never become risk zero. Embedding similarity is
 not spatial registration or evidence of cause. Quantitative CA remains outside
@@ -106,5 +108,19 @@ Search case matching ignores electrode names/order and preserves original names
 in output; scores are rounded before sorting, so very close values can tie by ID.
 Evaluation requires `--split` and `--partition`, excludes other query partitions
 and separately reports known positives absent from the index. Low-level defaults,
-coarse merging limits, zero/sub-cell jitter equality and caller-owned lineage
+coarse merge rejection, zero/sub-cell jitter equality and caller-owned lineage
 mapping are detailed in [training.md](docs/training.md).
+
+
+V3 compares joint layout/CNT/VIA anchor partitions between views at each scale;
+coarse area views also preserve their own native reference partition, rejecting
+both lost connections and spurious merges. The contact graph is an unverified
+geometry proxy, never proof of physical connectivity. Recipe/frame preflight
+runs before the first optimizer step. Typed view rejections receive bounded
+retries; small effective batches skip, while a wholly unusable epoch fails with
+counts and preserves the last completed checkpoint. Retry/skip histories resume
+exactly. V2-policy checkpoint/index inputs fail closed without migration.
+
+The array graph benchmark and finding-by-finding evidence are in
+[R4B_FIXES.md](docs/review/R4B_FIXES.md). G4/G6, actual connection semantics,
+real performance and independent candidate review remain pending.

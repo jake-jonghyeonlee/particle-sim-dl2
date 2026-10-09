@@ -29,9 +29,9 @@
         "intermediate_layer_policy": "preserve_exported_layers_v1"
       },
       "near_pitch_um": 0.5,
-      "wide_pitch_um": 1.0,
+      "wide_pitch_um": 0.5,
       "near_resampling_mode": "nearest",
-      "wide_resampling_mode": "area_coverage",
+      "wide_resampling_mode": "nearest",
       "jitter_xy_um": [
         0.3,
         0.3
@@ -40,7 +40,10 @@
         2,
         2
       ],
-      "topology_policy": "common_core_connectivity_v2"
+      "topology_policy": "common_core_connectivity_v3",
+      "connection_semantics": "global_contact_proxy_unverified",
+      "comparison_basis": "between_views_only",
+      "max_pair_attempts": 3
     },
     "loss": {
       "alignment_weight": 1,

@@ -110,3 +110,47 @@ R4-fix candidate validation: default **142 passed, 1 skipped in 9.31s**;
 `--run-training` **143 passed in 9.62s**. Exact commands and per-finding
 regressions are in the fix report linked above. Independent re-review remains
 pending; these author-run checks do not replace it.
+
+
+## Adopted v3 addendum / R4 re-review fixes
+
+Baseline `20a2ca8`; complete finding statuses, replaced assertions, independent
+hand-stated oracles and benchmark measurements are in
+[R4B_FIXES.md](review/R4B_FIXES.md). Both original review reports stay unchanged.
+V3 uses one joint layout/CNT/VIA contact graph at each scale, source-specific
+preflight, mandatory bounded retries, counted batch skipping and completed-epoch
+resume. The graph is explicitly `global_contact_proxy_unverified`, with
+`comparison_basis=between_views_only`; neither observed similarity nor graph
+acceptance establishes physical connectivity or real performance. Coarse area
+views reject both lost anchor connections and spurious anchor merges. Coarse
+nearest is rejected before training; v2-policy checkpoints/indexes are rejected
+without migration.
+
+The benchmark runs two warmups and five measured repeats with one CPU thread,
+no graph-result cache, source2000² / near400² / core200² / native-wide2000² or
+area-wide500², two layout channels + CNT + VIA + valid, seed2026. Both 1%-isolated
+and 30%-random CNT fixtures pass the `max(2s,10×crop)` validation bound and the
+500/1000/2000 growth bound. Validation medians are 0.1231/0.2206s (1% native/area)
+and 0.1954/0.2941s (30% native/area); crop medians 0.1175/0.1905/0.1178/0.1904s;
+full pair medians 0.2403/0.4122/0.3134/0.4840s. Largest growth ratio 3.570×,
+traced peaks 192.15–287.94 MiB, cumulative process maxrss up to 651.09 MiB.
+The fixture guards CNT away from layout contacts to time full successful
+validation; actual density, memory meaning, platform, versions and full sweep
+are recorded in [R4B_BENCHMARK.json](review/R4B_BENCHMARK.json). This measures
+synthetic cost, not real topology frequency or training/search quality.
+
+Default tests still perform only the authorized one real synthetic optimizer
+step. New multi-epoch retry/skip recovery tests use a tiny encoder and no-step
+optimizer spy; the actual synthetic optimizer/CLI chain remains opt-in. Tests
+prove discarded accepted pairs are counted as generated but unused, schema and
+identity failures are never retried, wholly unusable epochs keep the last
+checkpoint, and retry/skip order plus all RNG/optimizer state reproduce on resume.
+No real training was performed. User G4/G6 choices, producer endpoint semantics,
+real closed-network validation, CUDA, larger frames, T12 and fresh independent
+review remain pending.
+
+
+Final v3 candidate commands: `.venv/bin/python -m pytest -p no:warnings`
+→ **184 passed, 1 skipped in 8.84s**; the same command with `--run-training`
+→ **185 passed in 9.13s**. All tests block sockets. `git diff --check` passes.
+These checks are author evidence; fresh independent review remains pending.
