@@ -1,5 +1,7 @@
 # psdl2
 
+> 한국어 사용 안내: 전체 절차와 입력·출력 형식은 **[docs/USAGE.md](docs/USAGE.md)** 에 정리되어 있습니다.
+
 T10 provides offline `review_roi_v1` validation and original multi-layer near/wide
 ROI bundles. It preserves physical coordinates, endpoint roles and actual layers,
 CNT/VIA masks, valid coverage and source versions. T11 adds a small encoder with
