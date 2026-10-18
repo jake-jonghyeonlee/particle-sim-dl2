@@ -33,7 +33,7 @@ def shifted(mask, dy, dx):
     return out
 
 
-def write_export(root, product, rows):
+def write_export(root, product, rows, *, pitch=0.5):
     """rows: [(roi_id, case_id, center_xy_um, layouts(e1,e2))] → review_rois.json under root."""
     payload = json.loads((FIXTURE / 'review_rois.json').read_text())
     template = deepcopy(next(row for row in payload['rois'] if row['status'] == 'ready'))
@@ -45,7 +45,7 @@ def write_export(root, product, rows):
                    region_bbox_um=None, center_xy_um=list(center), analysis_layer='M2', failure_type='lateral_short',
                    frame_id='F', status='ready', reasons=[])
         row['source_identity'].update(product_id=product, case_id=case_id, frame_id='F')
-        row['frame'] = {'frame_id': 'F', 'length_unit': 'um', 'origin_xy_um': [0.0, 0.0], 'pixel_pitch_um': 0.5,
+        row['frame'] = {'frame_id': 'F', 'length_unit': 'um', 'origin_xy_um': [0.0, 0.0], 'pixel_pitch_um': pitch,
                         'shape_yx': list(SHAPE), 'axis_order': 'yx', 'origin_convention': 'top_left_cell_edge'}
         row['endpoints'] = [{'electrode_id': f'{product}_G', 'role': 'gate', 'actual_layer': 'M2'},
                             {'electrode_id': f'{product}_D', 'role': 'data', 'actual_layer': 'M2'}]
@@ -110,8 +110,8 @@ def test_baseline_recovers_pure_translation_exactly(products):
     assert top['product_id'] == 'B' and top['frame_id'] == 'F'
     assert [e['template_shape_yx'] for e in result['results'][0]['endpoints_used']] == [[4, 4], [4, 4]]
     evaluation = evaluate_positions(predictions_from_baseline(result), truths, tolerance_um=0.5, k=3)
-    assert evaluation['summary'] == {'n_queries': 1, 'n_evaluable': 1, 'n_unavailable': 0, 'top1_hit_rate': 1.0,
-                                     'hit_rate_at_3': 1.0, 'mean_top1_distance_um': pytest.approx(0.0),
+    assert evaluation['summary'] == {'n_queries': 1, 'n_evaluable': 1, 'n_unavailable': 0, 'n_duplicate_predictions_ignored': 0,
+                                     'top1_hit_rate': 1.0, 'hit_rate_at_3': 1.0, 'mean_top1_distance_um': pytest.approx(0.0),
                                      'median_top1_distance_um': pytest.approx(0.0)}
     assert evaluation['queries'][0]['candidates'][0]['hit'] is True
 
@@ -177,3 +177,29 @@ def test_cli_baseline_then_position_eval(products):
                               '--correspondence', truth_path, '--k', '2', '--out', tmp_path / 'x.json'],
                              capture_output=True, text=True, env=env)
     assert missing.returncode == 2 and 'hit-tolerance-um' in missing.stderr
+
+
+def test_pitch_mismatch_is_reported_not_matched_at_another_scale(products, tmp_path):
+    query_path, _, truth_path, _ = products
+    e1, e2 = masks_a()
+    coarse = write_export(tmp_path / 'B2', 'B', [('cb', 'B1', (4.0, 4.5), (shifted(e1, 4, 3), shifted(e2, 4, 3)))], pitch=1.0)
+    result = run_baseline(load_export(query_path), load_export(coarse), read_correspondence(truth_path), window_um=2.0, topk=1)
+    row = result['results'][0]
+    assert row['status'] == 'unavailable' and row['primary'] == []
+    assert sorted(row['reasons']) == ['pixel_pitch_mismatch:data/M2', 'pixel_pitch_mismatch:gate/M2']
+
+
+def test_even_count_median_and_duplicate_predictions(products, tmp_path):
+    *_, truth_path, _ = products
+    extra = correspondence(tmp_path / 'two.json', [('qa', (2.5, 2.5), (4.0, 4.5), 'ready'), ('qb', (7.5, 7.5), (6.0, 6.0), 'ready')])
+    truths = read_correspondence(extra)
+    def result(query, center):
+        return {'query': {'roi_id': query}, 'status': 'available',
+                'primary': [{'roi_id': 'x', 'product_id': 'B', 'frame': {'frame_id': 'F'}, 'center_xy_um': center, 'score': 0.5}]}
+    evaluation = evaluate_positions(predictions_from_search([result('qa', [4.0, 4.5]), result('qb', [6.0, 6.3]),
+                                                             result('qa', [9.0, 9.0])]), truths, tolerance_um=0.5, k=1)
+    assert evaluation['summary']['median_top1_distance_um'] == pytest.approx(0.15)
+    assert evaluation['summary']['n_duplicate_predictions_ignored'] == 1 and evaluation['summary']['n_evaluable'] == 2
+    assert evaluation['queries'][2]['reasons'] == ['duplicate_query_prediction_ignored']
+    assert evaluation['summary']['top1_hit_rate'] == 1.0
+

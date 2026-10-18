@@ -54,7 +54,10 @@ def zncc_map(image, template):
 
 
 def role_layer_unions(export):
-    """{(role, actual_layer): (frame, uint8 union mask)} over the ready ROI rows of one product export."""
+    """{(role, actual_layer): (frame, uint8 union mask)} = OR of the endpoint layout masks carried by the
+    ready ROI rows of one product export. This covers the whole product only when the export's rows
+    reference every electrode of that role/layer; an export built from labelled positions alone yields
+    only those electrodes, which the caller must keep in mind when reading hit rates."""
     unions, frames = {}, {}
     for roi in export.ready:
         for key, binding in roi.channel_bindings.items():
@@ -109,6 +112,9 @@ def match_query(query_roi, query_unions, candidate_unions, candidate_product, *,
             continue
         template = query_unions[pair][1][r0:r1, c0:c1]
         candidate_frame, image = candidate_unions[pair]
+        if Fraction(str(candidate_frame.pixel_pitch_um)) != Fraction(str(frame.pixel_pitch_um)):
+            reasons.append(f'pixel_pitch_mismatch:{pair[0]}/{pair[1]}')
+            continue
         score = zncc_map(image, template)
         if score is None:
             reasons.append(f'template_without_structure:{pair[0]}/{pair[1]}')

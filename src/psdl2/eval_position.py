@@ -71,14 +71,17 @@ def evaluate_positions(predictions, truths, *, tolerance_um, k):
     tolerance = number(tolerance_um, positive=True)
     if type(k) is not int or k < 1:
         raise ContractError('positive_k_required')
-    rows, top1_hits, topk_hits, top1_distances = [], 0, 0, []
+    rows, top1_hits, topk_hits, top1_distances, seen, duplicates = [], 0, 0, [], set(), 0
     for prediction in predictions:
         query = prediction['query_roi_id']
         labelled = truths.get(query, [])
         row = {'query_roi_id': query, 'source': prediction['source'], 'n_labelled_positions': len(labelled),
                'n_candidates': len(prediction['candidates']), 'status': 'available', 'reasons': [],
                'top1_distance_um': None, 'top1_hit': None, 'first_hit_rank': None, 'hit_at_k': None, 'candidates': []}
-        if not labelled:
+        if query in seen:
+            duplicates += 1
+            row.update(status='unavailable', reasons=['duplicate_query_prediction_ignored'])
+        elif not labelled:
             row.update(status='unavailable', reasons=['no_labelled_position_for_query'])
         elif not prediction['candidates']:
             row.update(status='unavailable', reasons=['no_candidates'])
@@ -101,13 +104,20 @@ def evaluate_positions(predictions, truths, *, tolerance_um, k):
             topk_hits += first_hit is not None
             if top1['distance_um'] is not None:
                 top1_distances.append(top1['distance_um'])
+        seen.add(query)
         rows.append(row)
     evaluable = [r for r in rows if r['status'] == 'available']
     n = len(evaluable)
+    ordered = sorted(top1_distances)
+    median = None
+    if ordered:
+        middle = len(ordered) // 2
+        median = ordered[middle] if len(ordered) % 2 else (ordered[middle - 1] + ordered[middle]) / 2
     summary = {'n_queries': len(rows), 'n_evaluable': n, 'n_unavailable': len(rows) - n,
+               'n_duplicate_predictions_ignored': duplicates,
                'top1_hit_rate': top1_hits / n if n else None, f'hit_rate_at_{k}': topk_hits / n if n else None,
                'mean_top1_distance_um': sum(top1_distances) / len(top1_distances) if top1_distances else None,
-               'median_top1_distance_um': sorted(top1_distances)[len(top1_distances) // 2] if top1_distances else None}
+               'median_top1_distance_um': median}
     return {'schema_version': SCHEMA, 'hit_tolerance_um': tolerance, 'k': k,
             'status': 'available' if n else 'unavailable', 'reasons': [] if n else ['no_evaluable_queries'],
             'summary': summary, 'queries': rows,
