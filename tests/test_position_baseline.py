@@ -197,9 +197,11 @@ def test_even_count_median_and_duplicate_predictions(products, tmp_path):
         return {'query': {'roi_id': query}, 'status': 'available',
                 'primary': [{'roi_id': 'x', 'product_id': 'B', 'frame': {'frame_id': 'F'}, 'center_xy_um': center, 'score': 0.5}]}
     evaluation = evaluate_positions(predictions_from_search([result('qa', [4.0, 4.5]), result('qb', [6.0, 6.3]),
-                                                             result('qa', [9.0, 9.0])]), truths, tolerance_um=0.5, k=1)
+                                                             result('qa', [4.0, 4.5])]), truths, tolerance_um=0.5, k=1)
     assert evaluation['summary']['median_top1_distance_um'] == pytest.approx(0.15)
     assert evaluation['summary']['n_duplicate_predictions_ignored'] == 1 and evaluation['summary']['n_evaluable'] == 2
-    assert evaluation['queries'][2]['reasons'] == ['duplicate_query_prediction_ignored']
+    assert evaluation['summary']['n_queries'] == 2 and len(evaluation['queries']) == 2  # identical repeat is not a row
     assert evaluation['summary']['top1_hit_rate'] == 1.0
+    with pytest.raises(ContractError, match='duplicate_query_prediction_conflict'):
+        evaluate_positions(predictions_from_search([result('qa', [4.0, 4.5]), result('qa', [9.0, 9.0])]), truths, tolerance_um=0.5, k=1)
 

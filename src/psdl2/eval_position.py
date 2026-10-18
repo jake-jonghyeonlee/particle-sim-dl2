@@ -71,17 +71,21 @@ def evaluate_positions(predictions, truths, *, tolerance_um, k):
     tolerance = number(tolerance_um, positive=True)
     if type(k) is not int or k < 1:
         raise ContractError('positive_k_required')
-    rows, top1_hits, topk_hits, top1_distances, seen, duplicates = [], 0, 0, [], set(), 0
+    rows, top1_hits, topk_hits, top1_distances, seen, duplicates = [], 0, 0, [], {}, 0
     for prediction in predictions:
         query = prediction['query_roi_id']
+        if query in seen:
+            # an identical repeat is dropped and counted; a conflicting repeat is a contract error
+            if prediction['candidates'] != seen[query]:
+                raise ContractError('duplicate_query_prediction_conflict: ' + query)
+            duplicates += 1
+            continue
+        seen[query] = prediction['candidates']
         labelled = truths.get(query, [])
         row = {'query_roi_id': query, 'source': prediction['source'], 'n_labelled_positions': len(labelled),
                'n_candidates': len(prediction['candidates']), 'status': 'available', 'reasons': [],
                'top1_distance_um': None, 'top1_hit': None, 'first_hit_rank': None, 'hit_at_k': None, 'candidates': []}
-        if query in seen:
-            duplicates += 1
-            row.update(status='unavailable', reasons=['duplicate_query_prediction_ignored'])
-        elif not labelled:
+        if not labelled:
             row.update(status='unavailable', reasons=['no_labelled_position_for_query'])
         elif not prediction['candidates']:
             row.update(status='unavailable', reasons=['no_candidates'])
@@ -104,7 +108,6 @@ def evaluate_positions(predictions, truths, *, tolerance_um, k):
             topk_hits += first_hit is not None
             if top1['distance_um'] is not None:
                 top1_distances.append(top1['distance_um'])
-        seen.add(query)
         rows.append(row)
     evaluable = [r for r in rows if r['status'] == 'available']
     n = len(evaluable)
