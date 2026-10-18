@@ -232,7 +232,20 @@ DL1이 고른 비교군 제품 id 목록이다. 검색의 주 결과는 이 제�
 # 7) 평가: 검색 결과 여러 개를 JSON 배열 하나로 묶어 준다
 .venv/bin/python -m psdl2.evaluate results.json --k 10 --split split.json \
   --partition test --labels labels.json
+
+# 8) 위치 평가 (수치 저장소의 roi_correspondence_v1 라벨; a.roi_id = query, b = 정답 위치)
+#    hit = 반환 후보 중심이 같은 제품·frame의 정답 중심에서 --hit-tolerance-um 안에 있을 때
+.venv/bin/python -m psdl2.eval_position --search runs/dl2_search_1.json runs/dl2_search_2.json \
+  --correspondence pairs_ids.json --hit-tolerance-um 5 --k 10 --out runs/eval_dl2.json
+
+# 9) 비DL 기준선: 같은 role/layer layout 합집합에 대한 ZNCC template matching (학습 없음)
+.venv/bin/python -m psdl2.baseline_ncc --query-export query/review_rois.json --index-export candidates/review_rois.json \
+  --correspondence pairs_ids.json --window-um 20 --topk 10 --out runs/baseline.json
+.venv/bin/python -m psdl2.eval_position --baseline runs/baseline.json \
+  --correspondence pairs_ids.json --hit-tolerance-um 5 --k 10 --out runs/eval_baseline.json
 ```
+
+8)·9)는 같은 지표(top-1 hit rate, hit rate@k, top-1 거리)를 내므로 DL2와 기준선을 같은 조건에서 비교한다. 허용오차와 창 크기는 사용자가 정하며 기본값이 없다. 수십 개 라벨로는 통계 주장을 하지 않는다.
 
 종료 코드:
 

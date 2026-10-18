@@ -154,3 +154,23 @@ Final v3 candidate commands: `.venv/bin/python -m pytest -p no:warnings`
 → **184 passed, 1 skipped in 8.84s**; the same command with `--run-training`
 → **185 passed in 9.13s**. All tests block sockets. `git diff --check` passes.
 These checks are author evidence; fresh independent review remains pending.
+
+## Position evaluation and template-matching baseline (PLAN_v3 T6, 2026-10-18)
+
+`psdl2.eval_position` reads `roi_correspondence_v1` files written by
+particle-sim-compare (side `a.roi_id` = query ROI, side `b` = labelled position in
+the candidate product) and scores either `psdl2.search` outputs or
+`psdl2.baseline_ncc` outputs with one metric: a query is a hit when a returned
+candidate centre lies within `--hit-tolerance-um` of a labelled centre in the same
+product and frame (top-1 hit rate, hit rate@k, top-1 distance). Queries without a
+label or without candidates are `unavailable`, never misses. `psdl2.baseline_ncc`
+is the non-learned reference: the query window (`--window-um`, no default) is cut
+from the role/layer layout union of the query product and matched by FFT ZNCC
+against the same role/layer union of the candidate product; endpoint maps are
+summed and peaks become predicted centres. A structureless template is reported,
+not guessed. Synthetic evidence: an exact translation is recovered with zero error
+and score 1.0 (`tests/test_position_baseline.py`). Both tools read JSON only and
+import no producer module. Real tolerance, window, labels and the DL2-versus-
+baseline decision remain the user's in the closed network; tens of labels are a
+decision aid, not a statistical claim.
+
