@@ -47,6 +47,8 @@ def atomic_torch_save(payload, path):
 
 def save_checkpoint(path, model, optimizer, config, *, epoch, view_rng=None, target_epochs=None, epoch_history=None):
     state = np.random.get_state()
+    # CUDA RNG state is saved only for a CUDA run, so a CPU checkpoint resumes on a CPU-only machine.
+    on_cuda = any(p.is_cuda for p in model.parameters())
     payload = {'schema_version': CHECKPOINT_SCHEMA, 'input_schema_version': 'original_roi_bundle_v1',
                'config': config, 'fingerprint': fingerprint(config), 'model': model.state_dict(),
                'model_fingerprint': model_fingerprint(model.state_dict()),
@@ -54,7 +56,7 @@ def save_checkpoint(path, model, optimizer, config, *, epoch, view_rng=None, tar
                'epoch_history': [] if epoch_history is None else epoch_history,
                'rng': {'python': random.getstate(), 'numpy': [state[0], state[1].tolist(), *state[2:]],
                        'torch': torch.get_rng_state(),
-                       'cuda': torch.cuda.get_rng_state_all() if torch.cuda.is_available() else [],
+                       'cuda': torch.cuda.get_rng_state_all() if on_cuda else [],
                        'views': None if view_rng is None else view_rng.bit_generator.state}}
     atomic_torch_save(payload, path)
 

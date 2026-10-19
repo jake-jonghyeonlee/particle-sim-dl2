@@ -36,6 +36,25 @@ uv pip install --no-index --find-links /approved/wheels -e .
 
 `requirements.lock`은 개발 기기(macOS)에 설치된 버전 기록이다. 폐쇄망 OS에 맞는 wheel로 같은 버전을 설치한다.
 
+### 2.1 GPU 환경 (Windows, pip mirror)
+
+DL1과 같은 torch 빌드(`2.7.1+cu118`)를 쓴다. psdl2는 `torch>=2.7.1`이면 되고, numpy·Pillow 버전은 DL1과 같다.
+기존 venv는 건드리지 않고 새 venv를 만든다(Git Bash).
+
+```bash
+export PIP_INDEX_URL=http://<mirror>/simple PIP_TRUSTED_HOST=<mirror-host>
+bash scripts/setup_gpu_venv.sh .venv-gpu        # +cu118 wheel이 다른 index에 있으면 TORCH_INDEX_URL 지정
+```
+
+스크립트는 CUDA 빌드 여부, GPU 이름·메모리, psdl2 CNN forward 한 번을 확인한다. CPU 빌드가 깔리면 실패로 끝난다.
+학습·색인·검색에 `--device cuda`를 붙인다. CUDA를 쓸 수 없으면 CPU로 넘어가지 않고 종료 코드 2로 멈춘다.
+
+기준 PC는 GTX 1660 Super 6 GB, RAM 16 GB다. 모델이 작아 GPU 메모리보다 RAM(원본 mask)이 먼저 한계가 된다.
+- 1660 Super는 tensor core가 없어 혼합정밀 이득이 작다. fp32로 돈다.
+- 원본 mask는 같은 파일(경로·hash)을 여러 ROI가 공유하므로 제품당 layer 수만큼만 메모리에 올라간다. 검증 요약의 `asset_memory.decoded_bytes`로 확인한다.
+- `--max-asset-memory-mb N`을 주면 디코딩한 mask가 N MB를 넘기 전에 종료 코드 2로 멈춘다(행 단위 blocked가 아니라 export 전체 거부). 이 값은 남아 있는 mask만 센다. 파일 바이트·디코딩 중간 배열은 따로 잠깐 더 쓰므로 RAM 전체보다 넉넉히 작게 준다. 16 GB에서는 8000 정도에서 시작해 `decoded_bytes`를 보고 조정한다(실측 전 제안값).
+- GPU 결과는 CPU와 소수점 아래에서 다를 수 있다. 같은 checkpoint는 어느 쪽에서도 읽힌다.
+
 ## 3. 입력
 
 ### 3.1 ROI 목록 `review_rois.json` — schema `review_roi_v1`
@@ -212,7 +231,12 @@ DL1이 고른 비교군 제품 id 목록이다. 검색의 주 결과는 이 제�
 
 # 4) 학습 (정답 없음)
 .venv/bin/python -m psdl2.train review_rois.json --assets-root original_assets \
-  --config config.json --lineages lineages.json --split split.json --out runs/dl2.pt
+  --config config.json --lineages lineages.json --split split.json --out runs/dl2.pt \
+  --device cuda --max-asset-memory-mb 8000
+#   진행 상황은 stderr에 JSON 줄로 나온다(DL1과 같은 형식): started → running(10초마다) → epoch_completed.
+#   epoch_completed에는 걸린 시간과 cuda_max_allocated_mb(GPU 최대 사용량)가 있다. --no-progress로 끈다.
+#   실패하면 오류 JSON은 stderr의 마지막 줄이다(앞에 진행 줄이 있을 수 있다). 결과 JSON은 stdout 한 줄 그대로다.
+#   CPU checkpoint에는 CUDA 난수 상태가 없어 CPU 전용 PC에서도 이어서 학습할 수 있다.
 
 # 이어서 학습: config의 epochs만 늘리고 --resume
 .venv/bin/python -m psdl2.train review_rois.json --assets-root original_assets \
@@ -221,12 +245,12 @@ DL1이 고른 비교군 제품 id 목록이다. 검색의 주 결과는 이 제�
 
 # 5) 색인: 후보 ROI 목록 전체를 벡터로
 .venv/bin/python -m psdl2.index candidates/review_rois.json --assets-root original_assets \
-  --checkpoint runs/dl2.pt --out runs/dl2_index.json
+  --checkpoint runs/dl2.pt --out runs/dl2_index.json --device cuda
 
 # 6) 검색: query ROI 하나
 .venv/bin/python -m psdl2.search query/review_rois.json --assets-root original_assets \
   --roi-id roi_aaa… --checkpoint runs/dl2.pt --index runs/dl2_index.json \
-  --cohort cohort.json --topk 10 --out runs/dl2_search.json
+  --cohort cohort.json --topk 10 --out runs/dl2_search.json --device cuda
 #   --expand 를 붙이면 cohort 밖 결과를 supplementary로 함께 낸다.
 
 # 7) 평가: 검색 결과 여러 개를 JSON 배열 하나로 묶어 준다

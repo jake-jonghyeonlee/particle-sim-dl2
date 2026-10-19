@@ -9,7 +9,7 @@ import torch
 
 from .checkpoint import fingerprint, load_checkpoint
 from .data import load_export
-from .model import Encoder, ModelConfig
+from .model import Encoder, ModelConfig, resolve_device
 from .schema import ContractError
 from .views import ViewConfig
 
@@ -50,14 +50,14 @@ def candidate_record(bundle, embedding):
             'embedding': [float(v) for v in embedding]}
 
 
-def load_encoder(checkpoint):
+def load_encoder(checkpoint, device='cpu'):
     from .checkpoint import read_checkpoint
     raw = torch.load(checkpoint, map_location='cpu', weights_only=True)
     config = raw['config']
     read_checkpoint(checkpoint, config)
     model = Encoder(ModelConfig(**config['model']))
     load_checkpoint(checkpoint, model, config)
-    model.eval()
+    model.to(resolve_device(device)).eval()
     return model, ViewConfig.from_dict(config['views']), fingerprint(
         {'config': raw['fingerprint'], 'weights': raw['model_fingerprint']})
 
@@ -94,11 +94,15 @@ def main(argv=None):
     parser.add_argument('export', type=Path); parser.add_argument('--assets-root', type=Path)
     parser.add_argument('--checkpoint', required=True, type=Path); parser.add_argument('--out', required=True, type=Path)
     parser.add_argument('--allow-unversioned-producer', action='store_true')
+    parser.add_argument('--max-asset-memory-mb', type=float, help='Reject the export if retained decoded masks would exceed this (transient decode buffers are extra)')
+    parser.add_argument('--device', choices=('cpu', 'cuda'), default='cpu')
     args = parser.parse_args(argv)
     try:
+        resolve_device(args.device)  # fail before the slow export load
         export = load_export(args.export, assets_root=args.assets_root,
-                             allow_unversioned_producer=args.allow_unversioned_producer)
-        model, views, fp = load_encoder(args.checkpoint)
+                             allow_unversioned_producer=args.allow_unversioned_producer,
+                             max_asset_memory_mb=args.max_asset_memory_mb)
+        model, views, fp = load_encoder(args.checkpoint, args.device)
         result = build_index(export.ready, model, views, fp)
         result['producer_versions'] = export.versions
         result['blocked_export_records'] = [dict(roi_id=r['roi_id'], reasons=r['reasons']) for r in export.blocked]

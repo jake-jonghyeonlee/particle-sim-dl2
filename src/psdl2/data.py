@@ -5,6 +5,7 @@ from dataclasses import dataclass
 import hashlib
 import io
 import json
+import math
 from pathlib import Path
 import re
 import sys
@@ -38,9 +39,11 @@ class Export:
     blocked: tuple[dict, ...]
     excluded_records: tuple[dict, ...]
     versions: dict
+    asset_memory: dict | None = None
 
     def summary(self):
         return {**self.versions, 'n_ready': len(self.ready), 'n_blocked': len(self.blocked),
+                'asset_memory': self.asset_memory,
                 'ready_roi_ids': [roi.row['roi_id'] for roi in self.ready],
                 'blocked': [{key: row[key] for key in ('roi_id', 'status', 'reasons', 'source_identity')}
                             for row in self.blocked], 'excluded_records': list(self.excluded_records)}
@@ -52,7 +55,31 @@ def _hash(value):
     return value
 
 
-def read_asset(root, ref, frame):
+class AssetMemoryLimit(ContractError):
+    """Resource guard over the whole export; never downgraded to a blocked row."""
+
+
+class AssetCache:
+    """Decoded masks shared by every ROI that references the same verified file.
+
+    Keyed by resolved path, declared hash, value semantics and frame shape, so many
+    ROIs over one full-frame layer hold one read-only array instead of one each.
+    """
+
+    def __init__(self, max_bytes=None):
+        self.max_bytes, self.arrays, self.references = max_bytes, {}, 0
+
+    @property
+    def decoded_bytes(self):
+        return sum(arr.nbytes for arr in self.arrays.values())
+
+    def report(self):
+        return {'decoded_assets': len(self.arrays), 'asset_references': self.references,
+                'decoded_bytes': self.decoded_bytes, 'max_bytes': self.max_bytes}
+
+
+def read_asset(root, ref, frame, cache=None):
+    # Reference checks run in the same order with or without a cache, so blocked reasons do not change.
     if not isinstance(ref, dict) or set(ref) != {'path', 'sha256', 'observed', 'value_semantics'}:
         raise ContractError('unsupported_asset_reference')
     if ref['observed'] is not True:
@@ -60,10 +87,24 @@ def read_asset(root, ref, frame):
     if ref['value_semantics'] not in ('binary', 'binary_zero_is_marked'):
         raise ContractError('unsupported_value_semantics')
     path = safe_path(root, ref['path'])
+    key = None
+    if cache is not None:
+        cache.references += 1
+        if isinstance(ref['sha256'], str):
+            # Only a reference whose path and declared hash were already verified can hit.
+            key = (str(path), ref['sha256'], ref['value_semantics'], tuple(frame.shape_yx))
+            if key in cache.arrays:
+                return cache.arrays[key]
     # Decode the same bytes whose checksum was checked.
     data = path.read_bytes()
     if hashlib.sha256(data).hexdigest() != _hash(ref['sha256']):
         raise ContractError('asset_hash_mismatch')
+    if cache is not None and cache.max_bytes is not None:
+        # Counts the retained uint8 masks only; transient decode buffers are extra. Checked before the
+        # format/shape/binary checks, so at the limit boundary an otherwise invalid file rejects the export.
+        projected = cache.decoded_bytes + int(np.prod(frame.shape_yx))
+        if projected > cache.max_bytes:
+            raise AssetMemoryLimit(f'asset_memory_limit_exceeded: decoded {projected} bytes > limit {cache.max_bytes}')
     if path.suffix.lower() == '.npy':
         arr = np.load(io.BytesIO(data), allow_pickle=False)
     elif path.suffix.lower() in ('.png', '.bmp', '.tif', '.tiff'):
@@ -83,6 +124,8 @@ def read_asset(root, ref, frame):
     mask = arr == 0 if ref['value_semantics'] == 'binary_zero_is_marked' else arr != 0
     mask = mask.astype(np.uint8)
     mask.flags.writeable = False
+    if key is not None:
+        cache.arrays[key] = mask
     return mask
 
 
@@ -92,7 +135,7 @@ def _endpoint(ep):
     return tuple(text(ep[k]) for k in ('electrode_id', 'role', 'actual_layer'))
 
 
-def _ready(row, root, versions):
+def _ready(row, root, versions, cache=None):
     allowed = {'product_id', 'design_version', 'case_id', 'source_identity', 'source_kind',
                'source_region_id', 'selection_policy_version', 'frame', 'frame_id',
                'center_xy_um', 'region_bbox_um', 'endpoints', 'failure_type', 'analysis_layer',
@@ -158,25 +201,32 @@ def _ready(row, root, versions):
         if set(entry) != {'endpoint', 'asset'} or entry['endpoint'] != endpoint:
             raise ContractError('layout_endpoint_binding_mismatch')
         key = f'layout:{i}'
-        channels[key] = read_asset(root, entry['asset'], frame)
+        channels[key] = read_asset(root, entry['asset'], frame, cache)
         channel_bindings[key] = deepcopy(endpoint)
     for key in ('cnt', 'valid'):
-        channels[key] = read_asset(root, assets[key], frame)
+        channels[key] = read_asset(root, assets[key], frame, cache)
     if not isinstance(assets['via'], list):
         raise ContractError('via_reference_list_required')
     for i, ref in enumerate(assets['via']):
-        channels[f'via:{i}'] = read_asset(root, ref, frame)
+        channels[f'via:{i}'] = read_asset(root, ref, frame, cache)
     if not channels['valid'][int(cy), int(cx)]:
         raise ContractError('position_outside_valid_domain')
     return ROI(deepcopy(row), frame, channels, channel_bindings, deepcopy(versions))
 
 
-def load_export(path, *, assets_root=None, expected_producer_commit=None, allow_unversioned_producer=False):
+def load_export(path, *, assets_root=None, expected_producer_commit=None, allow_unversioned_producer=False,
+                max_asset_memory_mb=None):
     """Invalid ready rows become blocked; envelope errors reject the export.
 
     assets_root explicitly relocates the unchanged producer references. Without it,
     use the producer's original root. Asset references must stay inside that root.
+    Decoded masks are shared across ROIs; ``max_asset_memory_mb`` rejects the whole
+    export before decoding would exceed it.
     """
+    if max_asset_memory_mb is not None and (isinstance(max_asset_memory_mb, bool) or not isinstance(max_asset_memory_mb, (int, float))
+                                            or not math.isfinite(max_asset_memory_mb) or not 0 < max_asset_memory_mb <= 2**40):
+        raise ContractError('max_asset_memory_mb_must_be_positive')
+    cache = AssetCache(None if max_asset_memory_mb is None else int(max_asset_memory_mb * 1024 * 1024))
     path = Path(path)
     payload = json.loads(path.read_text(encoding='utf-8'))
     if payload.get('schema_version') != SCHEMA_VERSION:
@@ -235,12 +285,14 @@ def load_export(path, *, assets_root=None, expected_producer_commit=None, allow_
         try:
             if rid in excluded_ids:
                 raise ContractError('excluded_record_not_candidate')
-            ready.append(_ready(row, root, versions))
+            ready.append(_ready(row, root, versions, cache))
+        except AssetMemoryLimit:
+            raise
         except (ContractError, KeyError, TypeError, ValueError, OSError) as exc:
             row['status'] = 'blocked'
             row['reasons'].append(str(exc) if isinstance(exc, ContractError) else 'invalid_original_source_record')
             blocked.append(row)
-    return Export(tuple(ready), tuple(blocked), tuple(deepcopy(excluded)), versions)
+    return Export(tuple(ready), tuple(blocked), tuple(deepcopy(excluded)), versions, cache.report())
 
 
 def main(argv=None):
@@ -249,11 +301,13 @@ def main(argv=None):
     parser.add_argument('--assets-root', type=Path, help='Explicit relocation root for original referenced assets')
     parser.add_argument('--expected-producer-commit', help='Require this exact producer revision')
     parser.add_argument('--allow-unversioned-producer', action='store_true', help='Explicitly accept a null producer commit with a declared reason')
+    parser.add_argument('--max-asset-memory-mb', type=float, help='Reject the export if retained decoded masks would exceed this (transient decode buffers are extra)')
     args = parser.parse_args(argv)
     try:
         result = load_export(args.export, assets_root=args.assets_root,
                              expected_producer_commit=args.expected_producer_commit,
-                             allow_unversioned_producer=args.allow_unversioned_producer)
+                             allow_unversioned_producer=args.allow_unversioned_producer,
+                             max_asset_memory_mb=args.max_asset_memory_mb)
         print(json.dumps(result.summary(), allow_nan=False))
         return 3 if result.blocked or result.excluded_records else 0
     except (ContractError, KeyError, TypeError, ValueError, OSError) as exc:

@@ -9,6 +9,17 @@ from torch.nn import functional as F
 
 from .schema import ContractError
 
+DEVICES = ('cpu', 'cuda')
+
+
+def resolve_device(name):
+    """Explicit cpu/cuda choice; an unavailable CUDA device is an error, never a silent CPU fallback."""
+    if name not in DEVICES:
+        raise ContractError('device_must_be_cpu_or_cuda')
+    if name == 'cuda' and not torch.cuda.is_available():
+        raise ContractError('cuda_device_unavailable')
+    return torch.device(name)
+
 
 @dataclass(frozen=True)
 class ModelConfig:

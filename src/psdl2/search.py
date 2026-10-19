@@ -145,24 +145,29 @@ def main(argv=None):
     parser.add_argument('--topk', required=True, type=int); parser.add_argument('--expand', action='store_true')
     parser.add_argument('--out', required=True, type=Path)
     parser.add_argument('--allow-unversioned-producer', action='store_true')
+    parser.add_argument('--max-asset-memory-mb', type=float, help='Reject the export if retained decoded masks would exceed this (transient decode buffers are extra)')
+    parser.add_argument('--device', choices=('cpu', 'cuda'), default='cpu')
     args = parser.parse_args(argv)
     try:
         import torch
         from .checkpoint import fingerprint
+        from .model import resolve_device
+        resolve_device(args.device)  # fail before the slow export load
         from .data import load_export
         from .index import candidate_record, load_encoder, view_config_dict
         imported = load_export(args.export, assets_root=args.assets_root,
-                             allow_unversioned_producer=args.allow_unversioned_producer)
+                             allow_unversioned_producer=args.allow_unversioned_producer,
+                             max_asset_memory_mb=args.max_asset_memory_mb)
         rois = [r for r in imported.ready if r.row['roi_id'] == args.roi_id]
         if len(rois) != 1:
             raise ContractError('one_ready_query_roi_required')
-        model, views, fp = load_encoder(args.checkpoint)
+        model, views, fp = load_encoder(args.checkpoint, args.device)
         index = json.loads(args.index.read_text())
         if index['checkpoint_fingerprint'] != fp or index['view_fingerprint'] != fingerprint(view_config_dict(views)):
             raise ContractError('incompatible_index_checkpoint_or_transform')
         bundle = views.bundle(rois[0])
         with torch.no_grad():
-            query = candidate_record(bundle, model([bundle])['embedding'][0].tolist())
+            query = candidate_record(bundle, model([bundle])['embedding'][0].cpu().tolist())
         result = search(query, index, read_cohort(args.cohort), topk=args.topk, expand=args.expand)
         args.out.parent.mkdir(parents=True, exist_ok=True); args.out.write_text(json.dumps(result, allow_nan=False, indent=2))
         print(json.dumps({'status': result['status'], 'primary': len(result['primary']), 'supplementary': len(result['supplementary']),

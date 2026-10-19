@@ -196,6 +196,29 @@ The following runs training only when the user explicitly invokes it:
   --out checkpoint.pt --resume checkpoint.pt
 ```
 
+`--device cpu|cuda` (default `cpu`) selects the training/inference device for
+`train`, `index` and `search`. An unavailable CUDA device is a contract error
+(exit 2), never a silent CPU fallback. The device is not part of the
+configuration fingerprint: a checkpoint written on one device loads and resumes
+on the other. CUDA RNG state is stored only by CUDA runs, so a CPU checkpoint
+resumes on a CPU-only machine. GPU arithmetic may differ from CPU in the last
+digits; bitwise CPU/GPU equality is not claimed. The closed-network GPU venv
+(`scripts/setup_gpu_venv.sh`) uses DL1's `torch 2.7.1+cu118`; the suite was run
+on torch 2.7.1 (CPU build) and 2.14.1.
+
+Decoded original masks are shared by every ROI that references the same file
+(resolved path, declared hash, value semantics and frame shape) and stay
+read-only. `--max-asset-memory-mb` (on `data`, `train`, `index`, `search`)
+rejects the whole export before the retained decoded masks would exceed the limit;
+it is a resource guard, not a blocked row. A reference is hash-verified before it is
+counted, so a bad file stays a blocked row. Transient file bytes and decode buffers
+are not counted; leave headroom below physical RAM. The limit is checked before
+format/shape/binary decoding checks, so a hash-valid but otherwise invalid file
+that arrives exactly at the limit rejects the export instead of blocking its row. Validation summaries report
+`asset_memory`. Training prints DL1-format JSON progress lines on stderr
+(`--no-progress` disables them); stdout keeps the single result JSON, and on
+failure the error JSON is the last stderr line.
+
 Only train-assigned rows are optimised. Rejected pairs are omitted and an effective
 batch below two is skipped after bounded retries; only an epoch with no usable batch fails. Final singleton batches are merged into the
 previous batch. No real training was run while implementing this package, and

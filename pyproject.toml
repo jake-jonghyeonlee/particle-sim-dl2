@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "Original multi-layer review ROI import and physical crop bundles"
 readme = "README.md"
 requires-python = ">=3.12"
-dependencies = ["numpy==2.5.3", "torch==2.14.1", "pillow==12.3.0"]
+dependencies = ["numpy==2.5.3", "torch>=2.7.1", "pillow==12.3.0"]
 
 [project.scripts]
 psdl2-validate = "psdl2.data:main"
