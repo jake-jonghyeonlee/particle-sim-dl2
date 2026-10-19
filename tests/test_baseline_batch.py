@@ -2,6 +2,7 @@
 from copy import deepcopy
 import hashlib
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -144,14 +145,16 @@ def test_self_check_passes_and_fails_on_shifted_centre(batch_products, tmp_path)
                           '--window-um', '4', '--topk', '2', '--out', out], capture_output=True, text=True, env={'PYTHONPATH': SRC})
     assert run.returncode == 0, run.stderr
     result = json.loads(out.read_text())
-    assert result['self_check'] == {'passed': True} and self_check_failures(result, pixel_pitch_um=0.5) == []
+    export = load_export(query_path)
+    assert result['self_check'] == {'passed': True} and self_check_failures(result, export) == []
+    assert all(r['self_map']['score'] == pytest.approx(1.0) for r in result['results'])
     bad = deepcopy(result)
     bad['results'][2]['query']['center_xy_um'][0] += 1.0  # two pixel pitches off its own match
-    failures = self_check_failures(bad, pixel_pitch_um=0.5)
+    failures = self_check_failures(bad, export)
     assert len(failures) == 1 and bad['results'][2]['query']['roi_id'] in failures[0]
-    low = deepcopy(result); low['results'][0]['self_location']['score'] = 0.9
-    assert 'score' in self_check_failures(low, pixel_pitch_um=0.5)[0]
-    assert self_check_failures({'results': []}, pixel_pitch_um=0.5) == ['no available query to check']
+    low = deepcopy(result); low['results'][0]['self_map']['score'] = 0.9
+    assert 'not ~1' in self_check_failures(low, export)[0]
+    assert self_check_failures({'results': []}, export) == ['no available query to check']
     both = subprocess.run([sys.executable, '-m', 'psdl2.baseline_ncc', '--query-export', query_path, '--self-check', '--index-export', query_path, '--max-memory-mb', '500',
                            '--window-um', '4', '--topk', '2', '--out', out], capture_output=True, text=True, env={'PYTHONPATH': SRC})
     assert both.returncode == 2 and 'self_check' in both.stderr
@@ -368,10 +371,10 @@ def test_self_check_accepts_periodic_self_matches_through_cli(tmp_path):
         assert run.returncode == 0, run.stderr  # 08ed566: q1..q3 reported as incorrect, exit 2
         result = json.loads(out.read_text())
         assert result['self_check'] == {'passed': True}
-        assert all(r['self_location']['score'] == pytest.approx(1.0) for r in result['results'])
+        assert all(r['self_map']['score'] == pytest.approx(1.0) for r in result['results'])
     rank1 = {tuple(r['primary'][0]['center_xy_um']) for r in result['results']}
     assert len(rank1) == 1 and rank1 != {(15.0, 15.0)}  # the periodic condition really holds: every row ranks the same repeat first
-    assert [r['self_location']['center_xy_um'] for r in result['results']] == [r['query']['center_xy_um'] for r in result['results']]
+    assert self_check_failures(result, load_export(query)) == []
 
 
 def test_self_check_requires_memory_cap(batch_products, tmp_path):
@@ -417,9 +420,51 @@ def test_sheet_write_leaves_no_partial_output_on_conflict(tmp_path):
     from psdl2 import review_sheet
     directory = tmp_path / 'd'; directory.mkdir()
     (directory / 'sheet.html').write_text('raced in')  # appears after the up-front check
-    with pytest.raises(FileExistsError):
-        review_sheet._write_all(directory, {'q0001_query.png': b'png', 'sheet.html': b'html'})
+    fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        with pytest.raises(FileExistsError):
+            review_sheet._write_all(fd, {'q0001_query.png': b'png', 'sheet.html': b'html'})
+    finally:
+        os.close(fd)
     assert [p.name for p in directory.iterdir()] == ['sheet.html'] and (directory / 'sheet.html').read_text() == 'raced in'
+
+
+def sheet_entry():
+    return {'roi_id': 'q', 'center_xy_um': [8, 8], 'status': 'available', 'reasons': [], 'score_gap': None, 'flags': {}, 'shared_with': [],
+            'query_invalid_pixels': 0, 'query_crop': np.array([[0, 1], [1, 0]]), 'matches': []}
+
+
+@pytest.mark.parametrize('swap_parent', [False, True])
+def test_sheet_directory_substitution_cannot_redirect_writes_or_cleanup(tmp_path, monkeypatch, swap_parent):
+    """After the first PNG is published the sheet dir (or its parent) is renamed away and replaced by a symlink to an outside
+    directory holding sentinels. 440d329 created the next temp file there and its rollback deleted the outside sentinel."""
+    from psdl2 import review_sheet
+    parent = tmp_path / 'parent'; parent.mkdir()
+    directory = parent / 'race'
+    outside = tmp_path / 'outside'
+    (outside / 'race' if swap_parent else outside).mkdir(parents=True)
+    victims = [(outside / 'race' if swap_parent else outside) / name for name in ('q0001_query.png', 'sheet.html')]
+    victims[0].write_bytes(b'EXTERNAL PNG SENTINEL'); victims[1].write_bytes(b'EXTERNAL HTML SENTINEL')
+    swapped_to = tmp_path / ('parent-original' if swap_parent else 'race-original')
+    real_open, swapped = os.open, []
+
+    def swap_then_open(path, *args, **kwargs):
+        if os.fspath(path).endswith('.sheet.html.tmp') and not swapped:  # the second file of the sheet is about to be created
+            moved = parent if swap_parent else directory
+            moved.rename(swapped_to)
+            moved.symlink_to(outside, target_is_directory=True)
+            swapped.append(True)
+        return real_open(path, *args, **kwargs)
+
+    with monkeypatch.context() as hook:
+        hook.setattr(review_sheet.os, 'open', swap_then_open)
+        with pytest.raises(ContractError, match='sheet_dir_(replaced_during_write|symlink_refused)'):
+            review_sheet.write_sheet(directory, [sheet_entry()], window_um=4, topk=1)
+    assert swapped
+    assert [v.read_bytes() for v in victims] == [b'EXTERNAL PNG SENTINEL', b'EXTERNAL HTML SENTINEL']  # nothing outside written or deleted
+    assert sorted(p.name for p in victims[0].parent.iterdir()) == ['q0001_query.png', 'sheet.html']  # no stray temp files outside
+    assert list((swapped_to / 'race' if swap_parent else swapped_to).iterdir()) == []  # the original directory holds no partial output
+    assert (parent if swap_parent else directory).is_symlink()  # the substituted link was never followed or replaced
 
 
 def punch_hole(root, product, case_id, box):
@@ -491,4 +536,113 @@ def test_output_records_deterministic_implementation_revision(batch_products, tm
         assert batch_cli(query, index, tmp_path / f'{name}.json').returncode == 0
         outs.append((tmp_path / f'{name}.json').read_bytes())
     assert outs[0] == outs[1]
-    assert json.loads(outs[0])['implementation_revision'] == bn.IMPLEMENTATION == 'baseline_ncc_batch_v1.1'  # 08ed566: key absent
+    assert json.loads(outs[0])['implementation_revision'] == bn.IMPLEMENTATION == 'baseline_ncc_batch_v1.2'  # 08ed566: key absent
+
+
+# ---- T2-fix2: re-review findings R1-R3 ----
+
+
+def test_sheet_dir_walk_is_fd_based_and_follows_only_trusted_links(tmp_path, monkeypatch):
+    from psdl2 import review_sheet
+    # new nested directories are created through the descriptor walk; a second write into the (now non-empty) dir is refused
+    target = tmp_path / 'a' / 'b'
+    assert review_sheet.write_sheet(target, [sheet_entry()], window_um=4, topk=1) == target / 'sheet.html'
+    assert sorted(p.name for p in target.iterdir()) == ['q0001_query.png', 'sheet.html']
+    with pytest.raises(ContractError, match='sheet_dir_not_empty'):
+        review_sheet.write_sheet(target, [sheet_entry()], window_um=4, topk=1)
+    # a user-owned link is refused anywhere on the path; a link is followed only when root owns it and its parent
+    (tmp_path / 'link').symlink_to(tmp_path / 'a')
+    with pytest.raises(ContractError, match='sheet_dir_symlink_refused'):
+        review_sheet.check_sheet_dir(tmp_path / 'link' / 'c')
+    parent = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        link = type('S', (), {'st_uid': 0})()
+        assert not review_sheet._trusted_link(parent, link)  # the parent belongs to the test user, not root
+        with monkeypatch.context() as fake:
+            fake.setattr(review_sheet.os, 'fstat', lambda fd: type('S', (), {'st_uid': 0, 'st_mode': 0o40755})())
+            assert review_sheet._trusted_link(parent, link) and not review_sheet._trusted_link(parent, type('S', (), {'st_uid': 501})())
+            fake.setattr(review_sheet.os, 'fstat', lambda fd: type('S', (), {'st_uid': 0, 'st_mode': 0o40777})())
+            assert not review_sheet._trusted_link(parent, link)  # world-writable parent: anyone could swap the link
+    finally:
+        os.close(parent)
+
+
+@pytest.mark.skipif(not os.path.islink('/tmp') or os.lstat('/tmp').st_uid != 0, reason='needs the root-owned /tmp system link (macOS)')
+def test_sheet_under_the_root_owned_tmp_link_still_works(tmp_path):
+    from psdl2 import review_sheet
+    import tempfile
+    with tempfile.TemporaryDirectory(dir='/tmp') as scratch:
+        target = Path(scratch) / 'sheet'
+        assert review_sheet.write_sheet(target, [sheet_entry()], window_um=4, topk=1) == target / 'sheet.html'
+        assert (Path(os.path.realpath(scratch)) / 'sheet' / 'sheet.html').is_file()
+
+
+def self_check_cli(query, out, topk='2'):
+    return ['--query-export', str(query), '--self-check', '--max-memory-mb', '500', '--window-um', '4', '--topk', topk, '--out', str(out)]
+
+
+def test_self_check_fails_when_the_matcher_uses_the_wrong_template(batch_products, tmp_path, monkeypatch, capsys):
+    query_path, _, _ = batch_products
+    real = bn.zncc_map
+    monkeypatch.setattr(bn, 'zncc_map', lambda image, template, *a, **k: real(image, 1 - template, *a, **k))
+    assert bn.main(self_check_cli(query_path, tmp_path / 'wrong.json')) == 2  # 440d329: exit 0 (a second, independent calculation passed)
+    err = capsys.readouterr().err
+    assert 'self_check_failed' in err and 'score map value' in err and not (tmp_path / 'wrong.json').exists()
+
+
+def test_self_check_fails_when_the_accumulated_map_is_corrupted(batch_products, tmp_path, monkeypatch, capsys):
+    query_path, _, _ = batch_products
+    real = bn.zncc_map
+    monkeypatch.setattr(bn, 'zncc_map', lambda *a, **k: 0.9 * real(*a, **k))  # every accumulated map is scaled: self position ~0.9
+    assert bn.main(self_check_cli(query_path, tmp_path / 'scaled.json')) == 2
+    assert 'not ~1' in capsys.readouterr().err
+
+
+def test_self_check_fails_when_the_emitted_coordinate_is_wrong(batch_products, tmp_path, monkeypatch, capsys):
+    query_path, _, _ = batch_products
+    real = bn._result_row
+
+    def shifted(*args, **kwargs):
+        row = real(*args, **kwargs)
+        row['primary'][0]['center_xy_um'][0] += 10.0 if row['primary'] else 0.0
+        return row
+
+    monkeypatch.setattr(bn, '_result_row', shifted)
+    assert bn.main(self_check_cli(query_path, tmp_path / 'moved.json', topk='1')) == 2  # 440d329: exit 0
+    assert 'maps to' in capsys.readouterr().err
+
+
+def test_self_check_reads_the_map_at_the_expected_index(batch_products, tmp_path, monkeypatch):
+    query_path, _, _ = batch_products
+    real = bn._finish_match
+
+    def misread(plan, total, topk, candidate_unions, probes=None):
+        return real(plan, total, topk, candidate_unions, None if probes is None else {k: (r + 1, c) for k, (r, c) in probes.items()})
+
+    monkeypatch.setattr(bn, '_finish_match', misread)
+    export = load_export(query_path)
+    result = run_baseline_batch(export, export, window_um=4.0, topk=2, self_check=True)
+    assert any('score map was read at' in f or 'not ~1' in f for f in self_check_failures(result, export))
+
+
+def test_valid_hole_counts_use_only_the_contributors_of_the_role_layer(tmp_path):
+    e1, e2 = random_masks(3)
+    query = tp.write_export(tmp_path / 'q', 'A', [('qa', 'A0', (8.0, 8.0), (e1, e2))])
+    index = tp.write_export(tmp_path / 'i', 'B', [('clean', 'B0', (8.0, 8.0), (e1, e2)), ('unrelated', 'B1', (8.0, 8.0), (e1, e2))])
+    payload = json.loads(index.read_text())
+    row = payload['rois'][1]
+    for k in range(2):  # the second ROI contributes to M3 only; the query and the first ROI use M2
+        row['endpoints'][k]['actual_layer'] = 'M3'
+        row['source_assets']['layouts'][k]['endpoint'] = dict(row['endpoints'][k])
+    row['analysis_layer'] = 'M3'
+    index.write_text(json.dumps(payload))
+    punch_hole(index.parent, 'B', 'B1', (12, 16, 12, 16))  # 4x4 hole on the M3-only contributor
+    loaded = load_export(index)
+    assert len(loaded.ready) == 2
+    invalid = bn.role_layer_valid(loaded)
+    assert not invalid[('gate', 'M2')].any() and int(invalid[('gate', 'M3')].sum()) == 16  # 440d329: one frame-wide array, 16 everywhere
+    assert invalid[('gate', 'M2')] is invalid[('data', 'M2')] and invalid[('gate', 'M3')] is invalid[('data', 'M3')]  # identical contributor sets share
+    assert invalid[('gate', 'M2')] is not invalid[('gate', 'M3')]
+    best = run_baseline_batch(load_export(query), loaded, window_um=4.0, topk=1)['results'][0]
+    assert [e['actual_layer'] for e in best['endpoints_used']] == ['M2', 'M2']
+    assert best['primary'][0]['invalid_pixel_count'] == 0 and best['flags']['candidate_valid_hole'] is False

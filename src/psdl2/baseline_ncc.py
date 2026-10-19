@@ -26,7 +26,7 @@ from .schema import ContractError, number, text
 
 SCHEMA = 'psdl2_baseline_ncc_v1'
 METHOD = 'zncc_fft_role_layer_union'
-IMPLEMENTATION = 'baseline_ncc_batch_v1.1'  # bump on any change of matching, flags or batch output semantics; never a timestamp
+IMPLEMENTATION = 'baseline_ncc_batch_v1.2'  # bump on any change of matching, flags or batch output semantics; never a timestamp
 
 
 class CandidateFFTCache:
@@ -127,16 +127,27 @@ def role_layer_unions(export):
 
 def role_layer_valid(export):
     """{(role, actual_layer): bool array, True = invalid pixel} for the candidate side: a pixel is invalid when any
-    ready ROI contributing to that role/layer reports it outside its valid domain. Pairs on one frame share one array."""
-    invalid, shared = {}, {}
-    for roi in export.ready:
+    ready ROI that contributes to that role/layer (carries a binding for it) reports it outside its valid domain.
+    ROIs that only contribute to other role/layers never enter. Pairs share one array only when their contributor sets
+    are identical; the arrays are read-only in use."""
+    contributors, frames = {}, {}
+    for index, roi in enumerate(export.ready):
         frame = roi.frame
         frame_key = (frame.frame_id, frame.origin_xy_um, frame.pixel_pitch_um, frame.shape_yx)
-        if frame_key not in shared:
-            shared[frame_key] = np.zeros(frame.shape_yx, dtype=bool)
-        np.logical_or(shared[frame_key], np.logical_not(roi.channels['valid'].astype(bool)), out=shared[frame_key])
         for binding in roi.channel_bindings.values():
-            invalid[(binding['role'], binding['actual_layer'])] = shared[frame_key]
+            pair = (binding['role'], binding['actual_layer'])
+            if frames.setdefault(pair, frame_key) != frame_key:
+                raise ContractError('multiple_candidate_frames_for_role_layer')
+            contributors.setdefault(pair, set()).add(index)
+    by_set, invalid = {}, {}
+    for pair, members in contributors.items():
+        key = frozenset(members)
+        if key not in by_set:
+            bad = np.zeros(frames[pair][3], dtype=bool)
+            for index in sorted(key):
+                np.logical_or(bad, np.logical_not(export.ready[index].channels['valid'].astype(bool)), out=bad)
+            by_set[key] = bad
+        invalid[pair] = by_set[key]
     return invalid
 
 
@@ -223,25 +234,31 @@ def _plan_match(prep, candidate_unions):
     return {'reasons': reasons, 'items': items, 'used': used, 'cells': prep['cells']}
 
 
-def _finish_match(plan, total, topk, candidate_unions):
-    """Peaks of the summed ZNCC map (None = nothing matched) as the match dict _result_row reads."""
+def _finish_match(plan, total, topk, candidate_unions, probes=None):
+    """Peaks of the summed ZNCC map (None = nothing matched) as the match dict _result_row reads. ``probes``
+    {query_id: (r, c)} are read straight from the accumulated map while it is resident (S2 self-check): the mean-over-
+    endpoints value at that map index, independent of top-k and suppression (None when the index is outside the map)."""
     r0, r1, c0, c1 = plan['cells']
     if total is None:
         return {'status': 'unavailable', 'reasons': plan['reasons'] or ['no_matchable_endpoint'], 'used': plan['used'], 'peaks': [],
                 'candidate_frame': None}
     candidate_frame = next(candidate_unions[(e['role'], e['actual_layer'])][0] for e in plan['used'])
     peaks = _peaks(total, topk, (max(1, (r1 - r0) // 2), max(1, (c1 - c0) // 2)))
-    return {'status': 'available', 'reasons': plan['reasons'], 'used': plan['used'], 'peaks': peaks, 'candidate_frame': candidate_frame}
+    matched = {'status': 'available', 'reasons': plan['reasons'], 'used': plan['used'], 'peaks': peaks, 'candidate_frame': candidate_frame}
+    if probes is not None:
+        matched['probe_values'] = {query_id: (float(total[r, c]) / len(plan['used']) if 0 <= r < total.shape[0] and 0 <= c < total.shape[1] else None)
+                                   for query_id, (r, c) in probes.items()}
+    return matched
 
 
-def _match_prepared(prep, candidate_unions, topk, cache):
+def _match_prepared(prep, candidate_unions, topk, cache, probes=None):
     """ZNCC maps of the endpoint templates against the candidate unions, summed; peaks as (r, c, score)."""
     plan = _plan_match(prep, candidate_unions)
     total = None
     for pair, template in plan['items']:
         score = zncc_map(candidate_unions[pair][1], template, cache, pair)
         total = score if total is None else total + score
-    return _finish_match(plan, total, topk, candidate_unions)
+    return _finish_match(plan, total, topk, candidate_unions, probes)
 
 
 def _result_row(query_roi, prep, matched, candidate_product):
@@ -338,27 +355,6 @@ def _candidate_invalid_counts(row, candidate_invalid):
         match['invalid_pixel_count'] = int(bad.sum())
 
 
-def _self_location(query_roi, prep, row, candidate_unions, candidate_product):
-    """S2 direct check: ZNCC (mean over the used endpoints) of the query template at its own window position in the
-    index and the centre that position maps to, evaluated without ranking, top-k or suppression, so equally
-    scoring periodic repeats cannot hide or replace it."""
-    r0, r1, c0, c1 = prep['cells']
-    used = {(e['role'], e['actual_layer']) for e in row['endpoints_used']}
-    scores = []
-    for pair, template in prep['spec']:
-        if pair not in used:
-            continue
-        t = np.asarray(template, dtype=np.float64)
-        t = t - t.mean()
-        window = np.asarray(candidate_unions[pair][1][r0:r1, c0:c1], dtype=np.float64)
-        window = window - window.mean()
-        denominator = math.sqrt(float((t * t).sum())) * math.sqrt(float((window * window).sum()))
-        scores.append(float((t * window).sum()) / denominator if denominator > 1e-9 else 0.0)
-    frame = candidate_unions[next(iter(used))][0]
-    mapped = _result_row_center(query_roi, prep, frame, r0, c0)
-    return {'score': sum(scores) / len(scores), 'center_xy_um': mapped}
-
-
 def _result_row_center(query_roi, prep, candidate_frame, r, c):
     # offset of the physical query centre inside its own template, kept exactly for the prediction
     frame = query_roi.frame
@@ -382,7 +378,7 @@ def _flags(prep, row, margin):
 
 
 def _run_batch(query_export, index_export, *, window_um, topk, ambiguity_margin=None, share_fft=True, dedupe=True,
-               max_memory_mb=None, sheet=False, all_at_once=False, self_location=False):
+               max_memory_mb=None, sheet=False, all_at_once=False, self_check=False):
     """Every ready ROI of the query export is a query. Candidate FFTs are shared (R1) and queries with an
     identical template hash are matched once (R2); each query still gets its own row. Score never decides
     anything here: rows are ordered by roi_id and the peaks are the caller's topk. Layers are processed one at a time
@@ -456,10 +452,11 @@ def _run_batch(query_export, index_export, *, window_um, topk, ambiguity_margin=
                             'reduce --window-um or the number of layers, or raise the limit')
     estimate = {'memory_estimate_bytes': max(e['memory_estimate_bytes'] for e in estimates),
                 'largest_layer_fft_bytes': chunk_estimate(group_order)['largest_layer_fft_bytes']}
+    probes = {key: {query_id: preps[query_id]['cells'][::2] for query_id in (groups[key] if dedupe else [key])} for key in group_order} if self_check else {}
     matched = {}
     if all_at_once:  # previous behaviour (every layer resident); kept as the equivalence reference for the tests
         for key in group_order:
-            matched[key] = _match_prepared(preps[groups[key][0]] if dedupe else preps[key], candidate_unions, topk, cache)
+            matched[key] = _match_prepared(preps[groups[key][0]] if dedupe else preps[key], candidate_unions, topk, cache, probes.get(key))
     else:
         for keys in chunks:
             units, totals, remaining = {}, {}, {key: len(plans[key]['items']) for key in keys}
@@ -467,7 +464,7 @@ def _run_batch(query_export, index_export, *, window_um, topk, ambiguity_margin=
                 for pair, template in plans[key]['items']:
                     units.setdefault((pair, template.shape), []).append((key, template))
                 if not remaining[key]:
-                    matched[key] = _finish_match(plans[key], None, topk, candidate_unions)
+                    matched[key] = _finish_match(plans[key], None, topk, candidate_unions, probes.get(key))
             for unit in sorted(units):
                 pair, template_shape = unit
                 image = candidate_unions[pair][1]
@@ -479,7 +476,7 @@ def _run_batch(query_export, index_export, *, window_um, topk, ambiguity_margin=
                         totals[key] = score
                     remaining[key] -= 1
                     if not remaining[key]:  # last layer of this group: peaks now, then free its accumulator
-                        matched[key] = _finish_match(plans[key], totals.pop(key), topk, candidate_unions)
+                        matched[key] = _finish_match(plans[key], totals.pop(key), topk, candidate_unions, probes.get(key))
                     del score
                 if cache is not None:
                     cache.release(pair, template_shape)
@@ -500,8 +497,8 @@ def _run_batch(query_export, index_export, *, window_um, topk, ambiguity_margin=
         group_key = hashes[query_id] if dedupe else query_id
         row = _result_row(roi, prep, matched[group_key], candidate_product)
         _candidate_invalid_counts(row, candidate_invalid)
-        if self_location and row['status'] == 'available':
-            row['self_location'] = _self_location(roi, prep, row, candidate_unions, candidate_product)
+        if self_check and row['status'] == 'available':  # the value the real accumulated map holds at the query's own window position
+            row['self_map'] = {'window_top_left_px_yx': list(prep['cells'][::2]), 'score': matched[group_key]['probe_values'][query_id]}
         shared = [other for other in groups[hashes[query_id]] if other != query_id] if dedupe else []
         results.append({**base, **row, 'query_invalid_pixel_count': prep['invalid_px'], 'template_sha256': hashes[query_id], 'shared_with': shared,
                         'flags': _flags(prep, row, ambiguity_margin)})
@@ -521,24 +518,49 @@ def run_baseline_batch(query_export, index_export, **kwargs):
     return _run_batch(query_export, index_export, **kwargs)[0]
 
 
-def self_check_failures(result, *, pixel_pitch_um):
-    """S2: against itself every available query's own window position (``self_location``, evaluated directly, independent
-    of rank, top-k and suppression) scores >= 0.999 and maps to the query's own centre within one pixel pitch. Periodic
-    layouts may rank other, equally scoring repeats first; none of them is chosen here. Returns the failure descriptions;
-    no available query is itself a failure."""
+def self_check_failures(result, query_export):
+    """S2: the export is matched against itself. For every available query (a) the accumulated score map the matcher
+    really computed, read at the query's own window position (``self_map``: independent of rank, top-k and suppression, so
+    periodic repeats cannot hide it), is ~1; (b) that position is the window position derived here from the export's frame and
+    the query centre; (c) every emitted rank entry maps back, by the geometry derived here from its map index, to the
+    centre it reports; (d) the rank-1 score is not below the map value at the own position. Periodic layouts may rank
+    other, equally scoring repeats first; none is chosen here. Returns the failure descriptions; no available query is
+    itself a failure."""
+    rois = {roi.row['roi_id']: roi for roi in query_export.ready}
     failures, available = [], 0
+    half = Fraction(str(result['window_um'])) / 2 if result['results'] else None
     for row in result['results']:
         if row['status'] != 'available':
             continue
         available += 1
-        query_id, (qx, qy) = row['query']['roi_id'], row['query']['center_xy_um']
-        own = row.get('self_location')
-        if own is None:
-            failures.append(f'{query_id}: no self_location recorded')
-        elif abs(own['center_xy_um'][0] - qx) > pixel_pitch_um or abs(own['center_xy_um'][1] - qy) > pixel_pitch_um:
-            failures.append(f'{query_id}: own window position maps to {own["center_xy_um"]}, not its own centre {[qx, qy]}')
-        elif own['score'] < 0.999:
-            failures.append(f'{query_id}: own-position score {own["score"]:.6f} < 0.999')
+        query_id = row['query']['roi_id']
+        roi = rois.get(query_id)
+        if roi is None:
+            failures.append(f'{query_id}: not a ready ROI of the checked export')
+            continue
+        frame = roi.frame
+        pitch = Fraction(str(frame.pixel_pitch_um))
+        cx, cy = Fraction(str(roi.center_xy_um[0])), Fraction(str(roi.center_xy_um[1]))
+        # own window origin (first pixel column/row of the window, clipped at the frame edge), from the physical centre
+        own_c = max(0, math.floor((cx - half - Fraction(str(frame.origin_xy_um[0]))) / pitch))
+        own_r = max(0, math.floor((cy - half - Fraction(str(frame.origin_xy_um[1]))) / pitch))
+        if [float(cx), float(cy)] != row['query']['center_xy_um']:
+            failures.append(f'{query_id}: reported query centre {row["query"]["center_xy_um"]} is not the export centre {[float(cx), float(cy)]}')
+            continue
+        own = row.get('self_map')
+        if own is None or own.get('score') is None:
+            failures.append(f'{query_id}: no score map value recorded at the own window position')
+        elif own['window_top_left_px_yx'] != [own_r, own_c]:
+            failures.append(f'{query_id}: score map was read at {own["window_top_left_px_yx"]}, not at the own window position {[own_r, own_c]}')
+        elif not 0.999 <= own['score'] <= 1.0 + 1e-6:
+            failures.append(f'{query_id}: score map value {own["score"]:.6f} at the own window position is not ~1')
+        elif row['primary'] and row['primary'][0]['score'] < own['score'] - 1e-9:
+            failures.append(f'{query_id}: rank-1 score {row["primary"][0]["score"]:.6f} is below the map value {own["score"]:.6f} at the own position')
+        for entry in row['primary']:
+            r, c = entry['template_top_left_px_yx']
+            expected = [float(cx + (c - own_c) * pitch), float(cy + (r - own_r) * pitch)]
+            if entry['frame_id'] != frame.frame_id or max(abs(a - b) for a, b in zip(entry['center_xy_um'], expected)) > 1e-9:
+                failures.append(f'{query_id}: rank {entry["rank"]} map index {[r, c]} maps to {expected}, but {entry["center_xy_um"]} was reported')
     if not available:
         failures.append('no available query to check')
     return failures
@@ -618,13 +640,12 @@ def main(argv=None):
             result, preps, query_unions, candidate_unions = _run_batch(query, index, window_um=args.window_um, topk=args.topk,
                                                                        ambiguity_margin=args.ambiguity_margin,
                                                                        max_memory_mb=args.max_memory_mb, sheet=args.sheet_dir is not None,
-                                                                       self_location=args.self_check)
+                                                                       self_check=args.self_check)
             result['inputs'] = {'query_export_sha256': _sha256(args.query_export), 'index_export_sha256': _sha256(index_path)}
             result['arguments'] = {'window_um': args.window_um, 'topk': args.topk, 'ambiguity_margin': args.ambiguity_margin,
                                    'max_memory_mb': args.max_memory_mb, 'self_check': args.self_check}
             if args.self_check:
-                pitches = {roi.frame.pixel_pitch_um for roi in query.ready}
-                failures = self_check_failures(result, pixel_pitch_um=max(pitches) if pitches else 0.0)
+                failures = self_check_failures(result, query)
                 if failures:
                     raise ContractError('self_check_failed: ' + '; '.join(failures))
                 result['self_check'] = {'passed': True}

@@ -184,18 +184,28 @@ matched once and listed in each other's `shared_with`. Per result `flags` report
 `--ambiguity-margin` is given, `near_equal_peaks`. Scores order and label the review
 sheet (`--sheet-dir`); nothing is thresholded, dropped or accepted by score.
 `--self-check` matches the export against itself (and, like `--all-ready`, requires `--max-memory-mb`)
-and exits 2 unless every available query's own window position, evaluated directly (independent of rank,
-top-k and suppression), scores >= 0.999 and maps to its own centre within one pixel pitch. Periodic layouts
+and exits 2 unless, for every available query, the accumulated score map the matcher really computed (read while it
+is resident, independent of rank, top-k and suppression) is ~1 (>= 0.999) at the query's own window position, that position equals the one the
+checker derives from the export frame and query centre, every emitted rank entry maps back from its map index to
+the centre it reports (checker-owned geometry formula), and rank 1 is not below the own-position value. A wrong template,
+a corrupted map or a shifted output coordinate therefore fails. Periodic layouts
 may rank another, equally scoring repeat first; the check neither depends on nor chooses one. Output JSON
-records the SHA256 of both export files, the arguments and `implementation_revision` (a constant of the
+records the SHA256 of both export files, the arguments and `implementation_revision` (`baseline_ncc_batch_v1.2`; a constant of the
 matcher, bumped on any behavioural change, never a timestamp); a re-run is byte-identical.
 Valid-domain holes: the query window's invalid pixels (`query_invalid_pixel_count`, flag `query_valid_hole`)
 and each returned candidate window's (`primary[].invalid_pixel_count`, flag `candidate_valid_hole`; a pixel
-counts when any contributing ROI marks it invalid) are reported and shown on the sheet; scores are unchanged
+counts when any ready ROI that contributes to that role/layer marks it invalid; ROIs bound only to other
+layers never count) are reported and shown on the sheet; scores are unchanged
 and nothing is accepted or rejected by them.
-`--sheet-dir` must not exist yet or be empty (symlinked directories or parents are refused; root-owned system
-links such as `/tmp` are tolerated); everything is planned first and files are created exclusively, so a
-conflict exits 2 before any output and never overwrites or follows a link. Template hashes frame role,
+`--sheet-dir` must not exist yet or be empty. The path is walked once with directory file descriptors
+(`O_DIRECTORY|O_NOFOLLOW` per component; user-planted symlinks anywhere in it are refused, only a root-owned link inside a
+root-owned, not group/world-writable directory such as macOS `/tmp` is followed) and every create, no-clobber
+publication (hard link) and rollback unlink is relative to that descriptor, so replacing the directory or an ancestor
+afterwards cannot redirect writes or deletions. Rollback removes only entries this run created (device/inode
+checked); after publishing, the path must still name the same directory, otherwise the run removes its files and exits 2
+(`sheet_dir_replaced_during_write`). Files are planned first and created exclusively, so a
+conflict exits 2 and never overwrites or follows a link. A hostile process with write access to the sheet directory
+itself can still race an individual name; the guarantee is no write or delete outside that directory. Template hashes frame role,
 layer, shape and mask length as JSON, so role/layer names containing `/` cannot collide.
 
 `--max-memory-mb N` is required with `--all-ready` and `--self-check` (no default). Layers (role, actual layer, template

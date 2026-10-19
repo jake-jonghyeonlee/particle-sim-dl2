@@ -9,6 +9,7 @@ import html
 import io
 import os
 from pathlib import Path
+import stat
 
 import numpy as np
 from PIL import Image
@@ -27,40 +28,125 @@ def _png(mask):
     return buffer.getvalue()
 
 
+def _trusted_link(parent_fd, link_stat):
+    """A symlink is followed only when nobody but root can have planted or can change it: the link and the directory
+    holding it are root-owned and that directory is not group/world-writable (the macOS ``/tmp -> private/tmp`` case)."""
+    parent = os.fstat(parent_fd)
+    return (link_stat.st_uid == 0 and parent.st_uid == 0 and not parent.st_mode & (stat.S_IWGRP | stat.S_IWOTH))
+
+
+def _open_dir(sheet_dir, *, create):
+    """(absolute path, fd of the directory, or None when it does not exist and ``create`` is false).
+
+    The path is walked once, component by component, with every directory opened O_DIRECTORY|O_NOFOLLOW relative to
+    its parent's descriptor, so the result cannot have been redirected by a symlink and the returned descriptor
+    stays bound to that directory whatever happens to the path afterwards. Missing components are created when
+    ``create``. Symlinks are refused except trusted root-owned system links (see ``_trusted_link``), which are
+    followed through the same descriptor walk; their targets must not contain ``..``."""
+    path = os.path.abspath(sheet_dir)
+    pending = [part for part in path.split('/') if part]
+    flags = os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0) | os.O_NOFOLLOW
+    fd = os.open('/', flags)
+    walked, followed = '', 0
+    try:
+        while pending:
+            name = pending.pop(0)
+            walked = f'{walked}/{name}'
+            try:
+                child = os.open(name, flags, dir_fd=fd)
+            except FileNotFoundError:
+                if not create:
+                    os.close(fd)
+                    return path, None
+                try:
+                    os.mkdir(name, 0o777, dir_fd=fd)
+                except FileExistsError:
+                    pass
+                child = os.open(name, flags, dir_fd=fd)
+            except OSError:
+                info = os.stat(name, dir_fd=fd, follow_symlinks=False)
+                if not stat.S_ISLNK(info.st_mode):
+                    raise ContractError(f'sheet_dir_not_a_directory: {walked}') from None
+                followed += 1
+                if followed > 8 or not _trusted_link(fd, info):
+                    raise ContractError(f'sheet_dir_symlink_refused: {walked}') from None
+                target = os.readlink(name, dir_fd=fd)
+                parts = [part for part in target.split('/') if part and part != '.']
+                if '..' in parts:
+                    raise ContractError(f'sheet_dir_symlink_refused: {walked} -> {target}') from None
+                if target.startswith('/'):
+                    os.close(fd)
+                    fd, walked = os.open('/', flags), ''
+                else:
+                    walked = walked.rsplit('/', 1)[0]
+                pending[:0] = parts
+                continue
+            os.close(fd)
+            fd = child
+        return path, fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def _require_empty(fd, path):
+    if os.listdir(fd):
+        raise ContractError(f'sheet_dir_not_empty: {path}')
+
+
 def check_sheet_dir(sheet_dir):
     """Collision policy: the sheet is written into a directory that does not exist yet or is empty; anything already
     there (any name, any symlink) is refused, and no path component the caller can have planted may be a symlink
-    (root-owned system links such as /tmp are tolerated). Returns the absolute directory path."""
-    path = Path(os.path.abspath(sheet_dir))
-    for part in (path, *path.parents):
-        if part.is_symlink() and part.lstat().st_uid != 0:
-            raise ContractError(f'sheet_dir_symlink_refused: {part}')
-    if path.exists():
-        if not path.is_dir():
-            raise ContractError(f'sheet_dir_not_a_directory: {path}')
-        if any(path.iterdir()):
-            raise ContractError(f'sheet_dir_not_empty: {path}')
-    return path
+    (root-owned system links such as /tmp are followed, see ``_trusted_link``). Returns the absolute directory path."""
+    path, fd = _open_dir(sheet_dir, create=False)
+    if fd is not None:
+        try:
+            _require_empty(fd, path)
+        finally:
+            os.close(fd)
+    return Path(path)
 
 
-def _write_all(directory, files):
-    """Create every file exclusively (O_EXCL|O_NOFOLLOW temp, then no-clobber hard link to the final name), so an
-    existing file or link is never followed or replaced; on any failure whatever was created is removed again."""
-    made = []
+def _same_inode(a, b):
+    return (a.st_dev, a.st_ino) == (b.st_dev, b.st_ino)
+
+
+def _write_all(dir_fd, files, verify=None):
+    """Create every file in the directory ``dir_fd`` is bound to, exclusively (O_EXCL|O_NOFOLLOW temp, then no-clobber
+    hard link to the final name), so an existing file or link is never followed or replaced. Every operation is relative
+    to ``dir_fd``; each created entry is remembered by (st_dev, st_ino). On any failure, or when ``verify()`` raises after
+    everything is published, exactly the entries this call created are unlinked again (identity re-checked), never a
+    different file that now carries the same name."""
+    made = {}  # name → (st_dev, st_ino) of what this call created
+
+    def remove(name):
+        try:
+            current = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return
+        if (current.st_dev, current.st_ino) == made[name]:
+            os.unlink(name, dir_fd=dir_fd)
+
     try:
         for name, data in files.items():
-            temp = directory / f'.{name}.tmp'
-            fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, 'O_NOFOLLOW', 0), 0o644)
-            made.append(temp)
+            temp = f'.{name}.tmp'
+            fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644, dir_fd=dir_fd)
             with os.fdopen(fd, 'wb') as handle:
+                info = os.fstat(handle.fileno())
+                made[temp] = (info.st_dev, info.st_ino)
                 handle.write(data)
-            os.link(temp, directory / name)  # fails if the name exists
-            made.append(directory / name)
-            os.unlink(temp)
-            made.remove(temp)
+            os.link(temp, name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd, follow_symlinks=False)  # fails if the name exists
+            made[name] = made[temp]
+            remove(temp)
+            del made[temp]
+        if verify is not None:
+            verify()
     except BaseException:
-        for leftover in made:
-            leftover.unlink(missing_ok=True)
+        for name in list(made):
+            try:
+                remove(name)
+            except OSError:
+                pass
         raise
 
 
@@ -71,7 +157,6 @@ def _fmt(value):
 def write_sheet(sheet_dir, entries, *, window_um, topk):
     """entries: dicts with roi_id, center_xy_um, status, reasons, score_gap, flags, shared_with, query_crop
     (2-D mask or None) and matches [{rank, score, center_xy_um, crop}]. Returns the sheet.html path."""
-    sheet_dir = check_sheet_dir(sheet_dir)
     files = {}  # every planned output name → bytes, built before the first byte is written
     top = lambda e: e['matches'][0]['score'] if e['matches'] else None
     ordered = sorted(entries, key=lambda e: (top(e) is None, -(top(e) or 0.0), e['roi_id']))
@@ -108,6 +193,21 @@ def write_sheet(sheet_dir, entries, *, window_um, topk):
         parts.append('</tr></table>')
     parts.append('</body></html>\n')
     files['sheet.html'] = '\n'.join(parts).encode('utf-8')
-    sheet_dir.mkdir(parents=True, exist_ok=True)
-    _write_all(sheet_dir, files)
-    return sheet_dir / 'sheet.html'
+    path, dir_fd = _open_dir(sheet_dir, create=True)
+    try:
+        _require_empty(dir_fd, path)
+        held = os.fstat(dir_fd)
+
+        def still_there():  # the directory we wrote into must still be what the path names (no rename/replacement meanwhile)
+            _, fd = _open_dir(path, create=False)
+            try:
+                if fd is None or not _same_inode(os.fstat(fd), held):
+                    raise ContractError(f'sheet_dir_replaced_during_write: {path}')
+            finally:
+                if fd is not None:
+                    os.close(fd)
+
+        _write_all(dir_fd, files, verify=still_there)
+    finally:
+        os.close(dir_fd)
+    return Path(path) / 'sheet.html'
