@@ -174,3 +174,36 @@ import no producer module. Real tolerance, window, labels and the DL2-versus-
 baseline decision remain the user's in the closed network; tens of labels are a
 decision aid, not a statistical claim.
 
+### Batch mode and periodicity (PLAN_v4 T2, 2026-10-19)
+
+`psdl2.baseline_ncc --all-ready` uses every ready ROI of the query export as a query
+(no labels). Candidate FFTs are built once per role/layer and template shape and
+shared; queries with identical template masks (SHA256 in `template_sha256`) are
+matched once and listed in each other's `shared_with`. Per result `flags` report
+`low_structure`, `window_clipped`, `score_gap` (rank 1 − rank 2) and, only when
+`--ambiguity-margin` is given, `near_equal_peaks`. Scores order and label the review
+sheet (`--sheet-dir`); nothing is thresholded, dropped or accepted by score.
+`--self-check` matches the export against itself and exits 2 unless every available
+query finds its own centre (within one pixel pitch) with score >= 0.999. Output JSON
+records the SHA256 of both export files and the arguments; a re-run is byte-identical.
+
+`--max-memory-mb N` is required with `--all-ready` (no default). Layers (role, actual layer, template
+shape) are matched one at a time and their FFTs freed afterwards; only queries that span several layers
+keep one summed score map until their last layer. Before any FFT the peak is estimated (one layer's FFT
+pair and working arrays + running sums + sheet crops; mask unions already loaded are not counted); above N
+the run exits 2 with the estimate, never degrading or truncating. The JSON reports
+`memory_estimate_bytes` and `largest_layer_fft_bytes`. Arithmetic stays float64.
+
+Query chunking: when the whole batch's estimate exceeds N, the template groups (queries with an identical
+template hash are one group and are never split, so they are still matched once) are cut into the largest
+contiguous chunks, in roi_id order, whose own estimate fits N, and the chunks run one after another; only
+peaks are kept between chunks. Each chunk recomputes the FFTs of the layers it touches, so more chunks
+means more FFT work (`fft_recomputations`). Peaks, scores and row order do not depend on N; the JSON adds
+`chunk_count` and `chunk_sizes` (groups per chunk). The run exits 2 only when one group's accumulator plus
+one layer FFT unit (plus the sheet crops) already exceeds N.
+
+Product frames repeat a 2×2 unit, so one template can have several near-equal peaks
+(one per repeat). `--topk` is the caller's value and should be at least the repeat
+count; the tool returns all of them with `near_equal_peaks` and never picks one
+automatically. The user chooses the repeat by looking at the sheet.
+

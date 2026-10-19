@@ -243,6 +243,13 @@ DL1이 고른 비교군 제품 id 목록이다. 검색의 주 결과는 이 제�
   --correspondence pairs_ids.json --window-um 20 --topk 10 --out runs/baseline.json
 .venv/bin/python -m psdl2.eval_position --baseline runs/baseline.json \
   --correspondence pairs_ids.json --hit-tolerance-um 5 --k 10 --out runs/eval_baseline.json
+# 9b) 배치 모드: 라벨 없이 query export의 ready ROI 전체를 질의로 사용 + 검토 시트
+.venv/bin/python -m psdl2.baseline_ncc --query-export query/review_rois.json --index-export candidates/review_rois.json \
+  --all-ready --max-memory-mb 8000 --window-um 30 --topk 4 --ambiguity-margin 0.02 --out runs/baseline_batch.json --sheet-dir runs/sheet
+#   runs/sheet/sheet.html 을 열면 질의별 템플릿과 상위 매칭 이미지가 점수 내림차순으로 나온다(점수는 정렬용, 자동 채택 없음).
+#   --max-memory-mb 는 --all-ready 에서 필수다. 층(role/layer)별로 FFT를 만들고 해제하며, 시작 전에 최대 메모리를 추정해 N MB를 넘으면 종료 코드 2로 멈춘다(자동 축소·절단 없음). 추정치는 출력 JSON의 memory_estimate_bytes 에 기록된다.
+#   전체 추정치가 N MB를 넘으면 질의(같은 템플릿 해시는 한 묶음)를 N MB에 맞는 가장 큰 chunk로 나눠 순서대로 처리한다. chunk마다 FFT를 다시 계산하므로 chunk가 많을수록 느려지고(fft_recomputations), 결과 순위·점수·행 순서는 N과 무관하다. JSON에 chunk_count, chunk_sizes 가 추가된다. 질의 하나의 누적 맵 + 층 FFT 하나가 N을 넘을 때만 종료 코드 2.
+#   --self-check --query-export … (--index-export 없이) 는 자기 자신에 매칭해 좌표·코드 오류를 점검한다(실패 시 종료 코드 2).
 ```
 
 8)·9)는 같은 지표(top-1 hit rate, hit rate@k, top-1 거리)를 내므로 DL2와 기준선을 같은 조건에서 비교한다. 허용오차와 창 크기는 사용자가 정하며 기본값이 없다. 수십 개 라벨로는 통계 주장을 하지 않는다.
