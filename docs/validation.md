@@ -183,11 +183,22 @@ matched once and listed in each other's `shared_with`. Per result `flags` report
 `low_structure`, `window_clipped`, `score_gap` (rank 1 − rank 2) and, only when
 `--ambiguity-margin` is given, `near_equal_peaks`. Scores order and label the review
 sheet (`--sheet-dir`); nothing is thresholded, dropped or accepted by score.
-`--self-check` matches the export against itself and exits 2 unless every available
-query finds its own centre (within one pixel pitch) with score >= 0.999. Output JSON
-records the SHA256 of both export files and the arguments; a re-run is byte-identical.
+`--self-check` matches the export against itself (and, like `--all-ready`, requires `--max-memory-mb`)
+and exits 2 unless every available query's own window position, evaluated directly (independent of rank,
+top-k and suppression), scores >= 0.999 and maps to its own centre within one pixel pitch. Periodic layouts
+may rank another, equally scoring repeat first; the check neither depends on nor chooses one. Output JSON
+records the SHA256 of both export files, the arguments and `implementation_revision` (a constant of the
+matcher, bumped on any behavioural change, never a timestamp); a re-run is byte-identical.
+Valid-domain holes: the query window's invalid pixels (`query_invalid_pixel_count`, flag `query_valid_hole`)
+and each returned candidate window's (`primary[].invalid_pixel_count`, flag `candidate_valid_hole`; a pixel
+counts when any contributing ROI marks it invalid) are reported and shown on the sheet; scores are unchanged
+and nothing is accepted or rejected by them.
+`--sheet-dir` must not exist yet or be empty (symlinked directories or parents are refused; root-owned system
+links such as `/tmp` are tolerated); everything is planned first and files are created exclusively, so a
+conflict exits 2 before any output and never overwrites or follows a link. Template hashes frame role,
+layer, shape and mask length as JSON, so role/layer names containing `/` cannot collide.
 
-`--max-memory-mb N` is required with `--all-ready` (no default). Layers (role, actual layer, template
+`--max-memory-mb N` is required with `--all-ready` and `--self-check` (no default). Layers (role, actual layer, template
 shape) are matched one at a time and their FFTs freed afterwards; only queries that span several layers
 keep one summed score map until their last layer. Before any FFT the peak is estimated (one layer's FFT
 pair and working arrays + running sums + sheet crops; mask unions already loaded are not counted); above N

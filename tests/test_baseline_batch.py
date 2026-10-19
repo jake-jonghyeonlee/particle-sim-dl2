@@ -64,7 +64,7 @@ def test_batch_row_equals_old_label_run(batch_products):
     assert len(new['results']) == 5 and new['n_queries'] == 5
     for row in old['results']:
         got = by_id[row['query']['roi_id']]
-        assert got['primary'] == row['primary'] and got['endpoints_used'] == row['endpoints_used'] and got['query'] == row['query']
+        assert [{k: v for k, v in m.items() if k != 'invalid_pixel_count'} for m in got['primary']] == row['primary'] and got['endpoints_used'] == row['endpoints_used'] and got['query'] == row['query']
     top = by_id['q3']['primary'][0]
     assert top['center_xy_um'] == pytest.approx([8.0, 15.0]) and top['score'] == pytest.approx(1.0)
     # label mode keeps its keys: no batch extras
@@ -140,7 +140,7 @@ def test_periodic_repeats_show_near_equal_peaks_without_selection(tmp_path):
 def test_self_check_passes_and_fails_on_shifted_centre(batch_products, tmp_path):
     query_path, _, _ = batch_products
     out = tmp_path / 'self.json'
-    run = subprocess.run([sys.executable, '-m', 'psdl2.baseline_ncc', '--query-export', query_path, '--self-check',
+    run = subprocess.run([sys.executable, '-m', 'psdl2.baseline_ncc', '--query-export', query_path, '--self-check', '--max-memory-mb', '500',
                           '--window-um', '4', '--topk', '2', '--out', out], capture_output=True, text=True, env={'PYTHONPATH': SRC})
     assert run.returncode == 0, run.stderr
     result = json.loads(out.read_text())
@@ -149,10 +149,10 @@ def test_self_check_passes_and_fails_on_shifted_centre(batch_products, tmp_path)
     bad['results'][2]['query']['center_xy_um'][0] += 1.0  # two pixel pitches off its own match
     failures = self_check_failures(bad, pixel_pitch_um=0.5)
     assert len(failures) == 1 and bad['results'][2]['query']['roi_id'] in failures[0]
-    low = deepcopy(result); low['results'][0]['primary'][0]['score'] = 0.9
+    low = deepcopy(result); low['results'][0]['self_location']['score'] = 0.9
     assert 'score' in self_check_failures(low, pixel_pitch_um=0.5)[0]
     assert self_check_failures({'results': []}, pixel_pitch_um=0.5) == ['no available query to check']
-    both = subprocess.run([sys.executable, '-m', 'psdl2.baseline_ncc', '--query-export', query_path, '--self-check', '--index-export', query_path,
+    both = subprocess.run([sys.executable, '-m', 'psdl2.baseline_ncc', '--query-export', query_path, '--self-check', '--index-export', query_path, '--max-memory-mb', '500',
                            '--window-um', '4', '--topk', '2', '--out', out], capture_output=True, text=True, env={'PYTHONPATH': SRC})
     assert both.returncode == 2 and 'self_check' in both.stderr
 
@@ -198,10 +198,11 @@ def synthetic_exports(n_layers, n_queries, side=400, pitch=0.1):
     rng = np.random.default_rng(7)
     frame = SimpleNamespace(frame_id='F', origin_xy_um=(0.0, 0.0), pixel_pitch_um=pitch, shape_yx=(side, side))
     masks = [(rng.random((side, side)) < 0.3).astype(np.uint8) for _ in range(n_layers)]
+    valid = np.ones((side, side), np.uint8)
 
     def roi(roi_id, center, layers):
         return SimpleNamespace(row={'roi_id': roi_id, 'product_id': 'P'}, frame=frame, center_xy_um=center,
-                               channels={f'e{k}': masks[k] for k in layers},
+                               channels={**{f'e{k}': masks[k] for k in layers}, 'valid': valid},
                                channel_bindings={f'e{k}': {'role': 'r', 'actual_layer': f'L{k}'} for k in layers})
     queries = [roi(f'q{j:02d}', (6.0 + 1.3 * j, 7.0 + 0.9 * j), sorted({j % n_layers, (j + 1) % n_layers, (j + 3) % n_layers}))
                for j in range(n_queries)]
@@ -348,3 +349,146 @@ def test_chunking_lowers_traced_peak_with_20_multilayer_queries():
           f'est {plain["memory_estimate_bytes"]} -> {chunked["memory_estimate_bytes"]}')
     assert chunked['chunk_count'] >= 4 and core(chunked) == core(plain)
     assert peak_chunked < peak_plain and peak_chunked <= chunked['memory_estimate_bytes']
+
+
+# ---- T2-fix: review findings B1-B4, A1, A2 ----
+
+
+def cli(*args):
+    return subprocess.run([sys.executable, '-m', 'psdl2.baseline_ncc', *map(str, args)], capture_output=True, text=True, env={'PYTHONPATH': SRC})
+
+
+def test_self_check_accepts_periodic_self_matches_through_cli(tmp_path):
+    masks = random_masks(5, tile=N // 2)  # 2×2 repetition: all four centres score ~1, rank 1 is always the first repeat
+    rows = [(f'q{i}', f'A{i}', center, masks) for i, center in enumerate([(5.0, 5.0), (15.0, 5.0), (5.0, 15.0), (15.0, 15.0)])]
+    query = tp.write_export(tmp_path / 'A', 'A', rows)
+    for topk in ('4', '1'):  # independent of top-k / suppression
+        out = tmp_path / f'p{topk}.json'
+        run = cli('--query-export', query, '--self-check', '--max-memory-mb', '500', '--window-um', '4', '--topk', topk, '--out', out)
+        assert run.returncode == 0, run.stderr  # 08ed566: q1..q3 reported as incorrect, exit 2
+        result = json.loads(out.read_text())
+        assert result['self_check'] == {'passed': True}
+        assert all(r['self_location']['score'] == pytest.approx(1.0) for r in result['results'])
+    rank1 = {tuple(r['primary'][0]['center_xy_um']) for r in result['results']}
+    assert len(rank1) == 1 and rank1 != {(15.0, 15.0)}  # the periodic condition really holds: every row ranks the same repeat first
+    assert [r['self_location']['center_xy_um'] for r in result['results']] == [r['query']['center_xy_um'] for r in result['results']]
+
+
+def test_self_check_requires_memory_cap(batch_products, tmp_path):
+    query_path, _, _ = batch_products
+    run = cli('--query-export', query_path, '--self-check', '--window-um', '4', '--topk', '2', '--out', tmp_path / 'x.json')
+    assert run.returncode == 2 and 'max_memory_mb_required' in run.stderr and not (tmp_path / 'x.json').exists()  # 08ed566: exit 0
+
+
+def batch_cli(query, index, out, *extra):
+    return cli('--query-export', query, '--index-export', index, '--all-ready', '--max-memory-mb', '500', '--window-um', '4', '--topk', '2',
+               '--out', out, *extra)
+
+
+def test_sheet_refuses_symlinks_and_existing_files(batch_products, tmp_path):
+    query, index, _ = batch_products
+    outside, outside_png = tmp_path / 'outside.txt', tmp_path / 'outside_png.txt'
+    outside.write_text('keep html'); outside_png.write_text('keep png')
+    sheet = tmp_path / 'sheet'
+    sheet.mkdir()
+    (sheet / 'sheet.html').symlink_to(outside)
+    (sheet / 'q0001_query.png').symlink_to(outside_png)
+    run = batch_cli(query, index, tmp_path / 'o.json', '--sheet-dir', sheet)
+    assert run.returncode == 2 and 'sheet_dir_not_empty' in run.stderr and not (tmp_path / 'o.json').exists()
+    assert outside.read_text() == 'keep html' and outside_png.read_text() == 'keep png'  # 08ed566 wrote through both links
+    assert sorted(p.name for p in sheet.iterdir()) == ['q0001_query.png', 'sheet.html']
+    # an ordinary pre-existing file is refused by name policy, not replaced
+    plain = tmp_path / 'plain'; plain.mkdir(); (plain / 'sheet.html').write_text('mine')
+    run = batch_cli(query, index, tmp_path / 'o.json', '--sheet-dir', plain)
+    assert run.returncode == 2 and 'sheet_dir_not_empty' in run.stderr and (plain / 'sheet.html').read_text() == 'mine'
+    assert [p.name for p in plain.iterdir()] == ['sheet.html']
+    # symlinked destination directory and symlinked parent
+    real = tmp_path / 'real'; real.mkdir()
+    (tmp_path / 'linkdir').symlink_to(real)
+    for target in (tmp_path / 'linkdir', tmp_path / 'linkdir' / 'sub'):
+        run = batch_cli(query, index, tmp_path / 'o.json', '--sheet-dir', target)
+        assert run.returncode == 2 and 'sheet_dir_symlink_refused' in run.stderr
+    assert list(real.iterdir()) == [] and not (tmp_path / 'o.json').exists()
+    # an empty or new directory is fine
+    assert batch_cli(query, index, tmp_path / 'o.json', '--sheet-dir', tmp_path / 'fresh' / 'deep').returncode == 0
+
+
+def test_sheet_write_leaves_no_partial_output_on_conflict(tmp_path):
+    from psdl2 import review_sheet
+    directory = tmp_path / 'd'; directory.mkdir()
+    (directory / 'sheet.html').write_text('raced in')  # appears after the up-front check
+    with pytest.raises(FileExistsError):
+        review_sheet._write_all(directory, {'q0001_query.png': b'png', 'sheet.html': b'html'})
+    assert [p.name for p in directory.iterdir()] == ['sheet.html'] and (directory / 'sheet.html').read_text() == 'raced in'
+
+
+def punch_hole(root, product, case_id, box):
+    path = root / f'{product}_{case_id}_valid.npy'
+    valid = np.load(path); r0, r1, c0, c1 = box; valid[r0:r1, c0:c1] = 0
+    np.save(path, valid)
+    manifest = root / 'review_rois.json'
+    payload = json.loads(manifest.read_text())
+    for row in payload['rois']:
+        if row['source_assets']['valid']['path'] == path.name:
+            row['source_assets']['valid']['sha256'] = hashlib.sha256(path.read_bytes()).hexdigest()
+    manifest.write_text(json.dumps(payload))
+
+
+def test_valid_domain_holes_are_flagged_and_shown_without_changing_scores(tmp_path):
+    query, index = pair_of_exports(tmp_path, [('qh', (8.0, 8.0))])
+    clean = run_baseline_batch(load_export(query), load_export(index), window_um=4.0, topk=2)['results'][0]
+    assert clean['flags']['query_valid_hole'] is False and clean['flags']['candidate_valid_hole'] is False
+    assert clean['query_invalid_pixel_count'] == 0 and clean['primary'][0]['invalid_pixel_count'] == 0
+    punch_hole(tmp_path / 'A', 'A', 'A0', (12, 16, 12, 16))  # inside the 12:20 template window; centre pixel (16, 16) stays valid
+    punch_hole(tmp_path / 'B', 'B', 'B1', (20, 22, 18, 20))  # inside the best candidate window rows 18:26, cols 16:24
+    out = tmp_path / 'h.json'
+    run = batch_cli(query, index, out, '--sheet-dir', tmp_path / 'sheet')
+    assert run.returncode == 0, run.stderr
+    row = json.loads(out.read_text())['results'][0]
+    assert row['flags']['query_valid_hole'] is True and row['query_invalid_pixel_count'] == 16  # 08ed566: no such flag
+    assert row['flags']['candidate_valid_hole'] is True and row['primary'][0]['template_top_left_px_yx'] == [18, 16]
+    assert row['primary'][0]['invalid_pixel_count'] == 4
+    assert row['status'] == 'available' and [p['score'] for p in row['primary']] == [p['score'] for p in clean['primary']]  # never auto-rejected
+    page = (tmp_path / 'sheet' / 'sheet.html').read_text(encoding='utf-8')
+    assert '질의 창 무효 영역 16px' in page and '무효 영역 4px' in page
+
+
+def custom_export(root, product, rows):
+    """rows: [(roi_id, case_id, center, [(role, layer, mask), (role, layer, mask)])] with free role/layer strings."""
+    path = tp.write_export(root, product, [(rid, case, center, (m[0][2], m[1][2])) for rid, case, center, m in rows])
+    payload = json.loads(path.read_text())
+    for row, (_, _, _, binds) in zip(payload['rois'], rows):
+        for k, (role, layer, _) in enumerate(binds):
+            row['endpoints'][k].update(role=role, actual_layer=layer)
+            row['source_assets']['layouts'][k]['endpoint'] = dict(row['endpoints'][k])
+    path.write_text(json.dumps(payload))
+    return path
+
+
+def test_template_hash_framing_is_unambiguous(tmp_path):
+    mask = random_masks(1)[0]
+    zeros = np.zeros_like(mask)
+    spec = lambda role, layer: {'pitch': 0.5, 'spec': [((role, layer), mask[:8, :8])]}
+    assert bn._template_sha256(spec('gate/x', 'M2')) != bn._template_sha256(spec('gate', 'x/M2'))  # 08ed566: equal
+    query = custom_export(tmp_path / 'A', 'A', [('q0', 'A0', (8.0, 8.0), [('gate/x', 'M2', mask), ('data', 'M2', zeros)]),
+                                                  ('q1', 'A1', (8.0, 8.0), [('gate', 'x/M2', mask), ('data', 'M2', zeros)])])
+    index = custom_export(tmp_path / 'B', 'B', [('c0', 'B0', (10.0, 10.0), [('gate/x', 'M2', tp.shifted(mask, 6, 4)), ('data', 'M2', zeros)]),
+                                                  ('c1', 'B1', (10.0, 10.0), [('gate', 'x/M2', tp.shifted(mask, 9, 8)), ('data', 'M2', zeros)])])
+    q, i = load_export(query), load_export(index)
+    dedup = run_baseline_batch(q, i, window_um=4.0, topk=2)
+    plain = run_baseline_batch(q, i, window_um=4.0, topk=2, dedupe=False)
+    rows = {r['query']['roi_id']: r for r in dedup['results']}
+    assert rows['q0']['template_sha256'] != rows['q1']['template_sha256'] and rows['q0']['shared_with'] == []
+    assert rows['q0']['primary'][0]['center_xy_um'] != rows['q1']['primary'][0]['center_xy_um']
+    key = lambda r: (r['query'], r['status'], r['primary'], r['endpoints_used'])
+    assert [key(r) for r in dedup['results']] == [key(r) for r in plain['results']]
+
+
+def test_output_records_deterministic_implementation_revision(batch_products, tmp_path):
+    query, index, _ = batch_products
+    outs = []
+    for name in ('a', 'b'):
+        assert batch_cli(query, index, tmp_path / f'{name}.json').returncode == 0
+        outs.append((tmp_path / f'{name}.json').read_bytes())
+    assert outs[0] == outs[1]
+    assert json.loads(outs[0])['implementation_revision'] == bn.IMPLEMENTATION == 'baseline_ncc_batch_v1.1'  # 08ed566: key absent
