@@ -187,7 +187,7 @@ sheet (`--sheet-dir`); nothing is thresholded, dropped or accepted by score.
 and exits 2 unless, for every available query, the accumulated score map the matcher really computed (read while it
 is resident, independent of rank, top-k and suppression) is ~1 (>= 0.999) at the query's own window position, that position equals the one the
 checker derives from the export frame and query centre, every emitted rank entry maps back from its map index to
-the centre it reports (checker-owned geometry formula, tolerance 16 ULPs of the largest coordinate involved, at least 1e-9 um and at most a thousandth of the pixel pitch, so large origins pass and a pixel-scale error never hides), every emitted score equals the value the accumulated map holds at that entry's own emitted index (`primary[].map_score`, read from the resident map and not from the peak tuple, so transposed or swapped peaks fail), and rank 1 is not below the own-position value. A wrong template,
+the centre it reports (checker-owned geometry formula, tolerance 16 ULPs of the largest coordinate involved, nominally at least 1e-9 um, but a thousandth of the pixel pitch is the hard upper bound, so a pixel-scale error never hides; origins such as 1e7-1e8 um pass, but once one coordinate ULP exceeds pitch/1000 (about 1e12 um at pitch 0.1) a correct output can be refused, and a pixel shift lost to float64 rounding (about 1e16 um) cannot be detected), every emitted score equals the value the accumulated map holds at that entry's own emitted index (`primary[].map_score`, read from the resident map and not from the peak tuple, so transposed or swapped peaks fail), and rank 1 is not below the own-position value. A wrong template,
 a corrupted map or a shifted output coordinate therefore fails. Periodic layouts
 may rank another, equally scoring repeat first; the check neither depends on nor chooses one. Output JSON
 records the SHA256 of both export files, the arguments and `implementation_revision` (`baseline_ncc_batch_v1.3`; a constant of the
@@ -220,8 +220,8 @@ template hash are one group and are never split, so they are still matched once)
 contiguous chunks, in roi_id order, whose own estimate fits N, and the chunks run one after another; only
 peaks are kept between chunks. Each chunk recomputes the FFTs of the layers it touches, so more chunks
 means more FFT work (`fft_recomputations`). Peaks, scores and row order do not depend on N; the JSON adds
-`chunk_count` and `chunk_sizes` (groups per chunk). The run exits 2 only when one group's accumulator plus
-one layer FFT unit (plus the sheet crops) already exceeds N.
+`chunk_count` and `chunk_sizes` (groups per chunk). Every chunk estimate also carries the resident validity maps and their two construction temporaries. The run exits 2 only when one group's accumulator plus
+one layer FFT unit (plus the sheet crops and validity maps) already exceeds N.
 
 Product frames repeat a 2×2 unit, so one template can have several near-equal peaks
 (one per repeat). `--topk` is the caller's value and should be at least the repeat

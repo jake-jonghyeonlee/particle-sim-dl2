@@ -670,8 +670,13 @@ def test_self_check_fails_when_scores_are_swapped_between_rank_entries(batch_pro
     real = bn._peaks
 
     def swapped(*args, **kwargs):
+        # Swap only the scores of ranks 2 and 3: rank 1 keeps its own score, so only a per-entry
+        # map_score check catches it.
         peaks = real(*args, **kwargs)
-        return [(r, c, peaks[(i + 1) % len(peaks)][2]) for i, (r, c, _) in enumerate(peaks)] if len(peaks) > 1 else peaks
+        if len(peaks) < 3:
+            return peaks
+        (r1, c1, s1), (r2, c2, s2) = peaks[1], peaks[2]
+        return [peaks[0], (r1, c1, s2), (r2, c2, s1), *peaks[3:]]
 
     monkeypatch.setattr(bn, '_peaks', swapped)
     assert bn.main(self_check_cli(query_path, tmp_path / 'swap.json', topk='3')) == 2  # c297774: exit 0
