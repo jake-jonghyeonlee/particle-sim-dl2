@@ -26,7 +26,7 @@ from .schema import ContractError, number, text
 
 SCHEMA = 'psdl2_baseline_ncc_v1'
 METHOD = 'zncc_fft_role_layer_union'
-IMPLEMENTATION = 'baseline_ncc_batch_v1.2'  # bump on any change of matching, flags or batch output semantics; never a timestamp
+IMPLEMENTATION = 'baseline_ncc_batch_v1.3'  # bump on any change of matching, flags or batch output semantics; never a timestamp
 
 
 class CandidateFFTCache:
@@ -246,6 +246,8 @@ def _finish_match(plan, total, topk, candidate_unions, probes=None):
     peaks = _peaks(total, topk, (max(1, (r1 - r0) // 2), max(1, (c1 - c0) // 2)))
     matched = {'status': 'available', 'reasons': plan['reasons'], 'used': plan['used'], 'peaks': peaks, 'candidate_frame': candidate_frame}
     if probes is not None:
+        # the value the accumulated map really holds at every emitted peak index, read here and not from _peaks' tuple
+        matched['peak_map_values'] = {(r, c): float(total[r, c]) / len(plan['used']) for r, c, _ in peaks}
         matched['probe_values'] = {query_id: (float(total[r, c]) / len(plan['used']) if 0 <= r < total.shape[0] and 0 <= c < total.shape[1] else None)
                                    for query_id, (r, c) in probes.items()}
     return matched
@@ -317,7 +319,7 @@ def _fft_terms_bytes(image_shape, template_shape):
     return padded[0] * (padded[1] // 2 + 1) * 16, padded[0] * padded[1] * 8, (H - h + 1) * (W - w + 1) * 8
 
 
-def estimate_batch_memory(units, groups, *, sheet_bytes=0):
+def estimate_batch_memory(units, groups, *, sheet_bytes=0, validity_bytes=0):
     """Peak resident bytes of the layer-by-layer batch, counted before any FFT is computed.
 
     ``units`` {unit key: (candidate image shape, template shape)}, unit key = (layer, template shape);
@@ -326,7 +328,8 @@ def estimate_batch_memory(units, groups, *, sheet_bytes=0):
     or applying it holds about 4 complex + 4 real padded arrays and 6 valid-size maps at once
     (``layer_peak = 4*C + 4*R + 6*V``). On top of that only template groups that span several layers keep a
     running sum of one valid map V from their first to their last layer. The candidate/query mask unions
-    are loaded before this point and not counted; ``sheet_bytes`` are the review-sheet crops."""
+    are loaded before this point and not counted; ``sheet_bytes`` are the review-sheet crops and ``validity_bytes`` the
+    per-contributor-set validity maps (resident for the whole run)."""
     order = sorted(units)
     index = {unit: i for i, unit in enumerate(order)}
     sizes = {unit: _fft_terms_bytes(*shapes) for unit, shapes in units.items()}
@@ -341,7 +344,16 @@ def estimate_batch_memory(units, groups, *, sheet_bytes=0):
         live = sum(v for first, last, v in spans if first <= i <= last)
         peak = max(peak, 4 * C + 4 * R + 6 * V + live)
         largest = max(largest, 2 * C)
-    return {'memory_estimate_bytes': peak + sheet_bytes if order else sheet_bytes, 'largest_layer_fft_bytes': largest}
+    fixed = sheet_bytes + validity_bytes
+    return {'memory_estimate_bytes': peak + fixed if order else fixed, 'largest_layer_fft_bytes': largest}
+
+
+def validity_map_footprint(candidate_invalid):
+    """(distinct map count, persistent bytes, bytes to count in the estimate): one bool array per distinct contributor set; the
+    estimate adds two largest-map temporaries held while the last one is built (logical_not + astype)."""
+    unique = {id(m): m for m in candidate_invalid.values()}
+    persistent = sum(m.nbytes for m in unique.values())
+    return len(unique), persistent, persistent + 2 * max((m.nbytes for m in unique.values()), default=0)
 
 
 def _candidate_invalid_counts(row, candidate_invalid):
@@ -418,6 +430,7 @@ def _run_batch(query_export, index_export, *, window_um, topk, ambiguity_margin=
     plans = {key: _plan_match(preps[groups[key][0]] if dedupe else preps[key], candidate_unions) for key in group_order}
     group_units = {key: [(pair, template.shape) for pair, template in plans[key]['items']] for key in group_order}
     shapes = {u: (candidate_unions[u[0]][1].shape, u[1]) for units in group_units.values() for u in units}
+    validity_count, validity_bytes, validity_estimate = validity_map_footprint(candidate_invalid)
     sheet_bytes = 0
     if sheet:  # one query crop + topk match crops (bool) per query
         for query_id, prep in preps.items():
@@ -427,7 +440,7 @@ def _run_batch(query_export, index_export, *, window_um, topk, ambiguity_margin=
 
     def chunk_estimate(keys):
         used = {u for key in keys for u in group_units[key]}
-        return estimate_batch_memory({u: shapes[u] for u in used}, [group_units[key] for key in keys], sheet_bytes=sheet_bytes)
+        return estimate_batch_memory({u: shapes[u] for u in used}, [group_units[key] for key in keys], sheet_bytes=sheet_bytes, validity_bytes=validity_estimate)
 
     limit = None if max_memory_mb is None else max_memory_mb * 1024 * 1024
     # Query chunking: the template groups (queries with one template hash are one group, so identical templates are never
@@ -451,7 +464,8 @@ def _run_batch(query_export, index_export, *, window_um, topk, ambiguity_margin=
                             f'({max(over) / 2 ** 20:.1f} MB) > --max-memory-mb {max_memory_mb:g} even for one query; '
                             'reduce --window-um or the number of layers, or raise the limit')
     estimate = {'memory_estimate_bytes': max(e['memory_estimate_bytes'] for e in estimates),
-                'largest_layer_fft_bytes': chunk_estimate(group_order)['largest_layer_fft_bytes']}
+                'largest_layer_fft_bytes': chunk_estimate(group_order)['largest_layer_fft_bytes'],
+                'validity_map_count': validity_count, 'validity_map_bytes': validity_bytes}
     probes = {key: {query_id: preps[query_id]['cells'][::2] for query_id in (groups[key] if dedupe else [key])} for key in group_order} if self_check else {}
     matched = {}
     if all_at_once:  # previous behaviour (every layer resident); kept as the equivalence reference for the tests
@@ -497,6 +511,10 @@ def _run_batch(query_export, index_export, *, window_um, topk, ambiguity_margin=
         group_key = hashes[query_id] if dedupe else query_id
         row = _result_row(roi, prep, matched[group_key], candidate_product)
         _candidate_invalid_counts(row, candidate_invalid)
+        if self_check and row['status'] == 'available':  # keep the map reading attached to each emitted entry (checked on the JSON itself)
+            peak_map = matched[group_key]['peak_map_values']
+            for entry in row['primary']:
+                entry['map_score'] = peak_map.get(tuple(entry['template_top_left_px_yx']))
         if self_check and row['status'] == 'available':  # the value the real accumulated map holds at the query's own window position
             row['self_map'] = {'window_top_left_px_yx': list(prep['cells'][::2]), 'score': matched[group_key]['probe_values'][query_id]}
         shared = [other for other in groups[hashes[query_id]] if other != query_id] if dedupe else []
@@ -516,6 +534,13 @@ def _run_batch(query_export, index_export, *, window_um, topk, ambiguity_margin=
 
 def run_baseline_batch(query_export, index_export, **kwargs):
     return _run_batch(query_export, index_export, **kwargs)[0]
+
+
+def _geometry_tolerance(pitch, magnitudes):
+    """Float-versus-exact geometry tolerance: 16 ULPs of the largest coordinate involved (the matcher adds terms of that size in
+    float64), never below 1e-9 um and never above a thousandth of the pixel pitch, so a pixel-scale error cannot hide at any origin."""
+    ulps = 16 * math.ulp(max(abs(float(m)) for m in magnitudes))
+    return min(max(1e-9, ulps), float(pitch) * 1e-3)
 
 
 def self_check_failures(result, query_export):
@@ -559,7 +584,11 @@ def self_check_failures(result, query_export):
         for entry in row['primary']:
             r, c = entry['template_top_left_px_yx']
             expected = [float(cx + (c - own_c) * pitch), float(cy + (r - own_r) * pitch)]
-            if entry['frame_id'] != frame.frame_id or max(abs(a - b) for a, b in zip(entry['center_xy_um'], expected)) > 1e-9:
+            tolerance = _geometry_tolerance(pitch, [cx, cy, Fraction(str(frame.origin_xy_um[0])), Fraction(str(frame.origin_xy_um[1])), *expected])
+            mapped = entry.get('map_score')
+            if mapped is None or abs(mapped - entry['score']) > 1e-9:
+                failures.append(f'{query_id}: rank {entry["rank"]} reports score {entry["score"]!r} at map index {[r, c]}, but the accumulated map holds {mapped!r} there')
+            if entry['frame_id'] != frame.frame_id or max(abs(a - b) for a, b in zip(entry['center_xy_um'], expected)) > tolerance:
                 failures.append(f'{query_id}: rank {entry["rank"]} map index {[r, c]} maps to {expected}, but {entry["center_xy_um"]} was reported')
     if not available:
         failures.append('no available query to check')

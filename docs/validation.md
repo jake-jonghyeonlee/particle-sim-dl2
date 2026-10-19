@@ -187,10 +187,10 @@ sheet (`--sheet-dir`); nothing is thresholded, dropped or accepted by score.
 and exits 2 unless, for every available query, the accumulated score map the matcher really computed (read while it
 is resident, independent of rank, top-k and suppression) is ~1 (>= 0.999) at the query's own window position, that position equals the one the
 checker derives from the export frame and query centre, every emitted rank entry maps back from its map index to
-the centre it reports (checker-owned geometry formula), and rank 1 is not below the own-position value. A wrong template,
+the centre it reports (checker-owned geometry formula, tolerance 16 ULPs of the largest coordinate involved, at least 1e-9 um and at most a thousandth of the pixel pitch, so large origins pass and a pixel-scale error never hides), every emitted score equals the value the accumulated map holds at that entry's own emitted index (`primary[].map_score`, read from the resident map and not from the peak tuple, so transposed or swapped peaks fail), and rank 1 is not below the own-position value. A wrong template,
 a corrupted map or a shifted output coordinate therefore fails. Periodic layouts
 may rank another, equally scoring repeat first; the check neither depends on nor chooses one. Output JSON
-records the SHA256 of both export files, the arguments and `implementation_revision` (`baseline_ncc_batch_v1.2`; a constant of the
+records the SHA256 of both export files, the arguments and `implementation_revision` (`baseline_ncc_batch_v1.3`; a constant of the
 matcher, bumped on any behavioural change, never a timestamp); a re-run is byte-identical.
 Valid-domain holes: the query window's invalid pixels (`query_invalid_pixel_count`, flag `query_valid_hole`)
 and each returned candidate window's (`primary[].invalid_pixel_count`, flag `candidate_valid_hole`; a pixel
@@ -211,9 +211,9 @@ layer, shape and mask length as JSON, so role/layer names containing `/` cannot 
 `--max-memory-mb N` is required with `--all-ready` and `--self-check` (no default). Layers (role, actual layer, template
 shape) are matched one at a time and their FFTs freed afterwards; only queries that span several layers
 keep one summed score map until their last layer. Before any FFT the peak is estimated (one layer's FFT
-pair and working arrays + running sums + sheet crops; mask unions already loaded are not counted); above N
+pair and working arrays + running sums + sheet crops + the per-contributor-set validity maps and their two construction temporaries; mask unions already loaded are not counted); above N
 the run exits 2 with the estimate, never degrading or truncating. The JSON reports
-`memory_estimate_bytes` and `largest_layer_fft_bytes`. Arithmetic stays float64.
+`memory_estimate_bytes`, `largest_layer_fft_bytes`, `validity_map_count` (distinct contributor sets, one bool map each) and `validity_map_bytes`. The maps grow with the number of distinct contributor sets (up to one per role/layer) and are resident for the whole run, so they count against the cap. Arithmetic stays float64.
 
 Query chunking: when the whole batch's estimate exceeds N, the template groups (queries with an identical
 template hash are one group and are never split, so they are still matched once) are cut into the largest

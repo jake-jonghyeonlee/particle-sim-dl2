@@ -536,7 +536,7 @@ def test_output_records_deterministic_implementation_revision(batch_products, tm
         assert batch_cli(query, index, tmp_path / f'{name}.json').returncode == 0
         outs.append((tmp_path / f'{name}.json').read_bytes())
     assert outs[0] == outs[1]
-    assert json.loads(outs[0])['implementation_revision'] == bn.IMPLEMENTATION == 'baseline_ncc_batch_v1.2'  # 08ed566: key absent
+    assert json.loads(outs[0])['implementation_revision'] == bn.IMPLEMENTATION == 'baseline_ncc_batch_v1.3'  # 08ed566: key absent
 
 
 # ---- T2-fix2: re-review findings R1-R3 ----
@@ -646,3 +646,83 @@ def test_valid_hole_counts_use_only_the_contributors_of_the_role_layer(tmp_path)
     best = run_baseline_batch(load_export(query), loaded, window_um=4.0, topk=1)['results'][0]
     assert [e['actual_layer'] for e in best['endpoints_used']] == ['M2', 'M2']
     assert best['primary'][0]['invalid_pixel_count'] == 0 and best['flags']['candidate_valid_hole'] is False
+
+
+def asymmetric_query(tmp_path):
+    return tp.write_export(tmp_path / 'asym', 'A', [('q', 'A0', (8.0, 10.0), random_masks(3))], pitch=0.5)
+
+
+def asym_cli(query, out):
+    return ['--query-export', str(query), '--self-check', '--max-memory-mb', '500', '--window-um', '4', '--topk', '1', '--out', str(out)]
+
+
+def test_self_check_fails_when_peak_row_and_column_are_transposed(tmp_path, monkeypatch, capsys):
+    query = asymmetric_query(tmp_path)
+    assert bn.main(asym_cli(query, tmp_path / 'ok.json')) == 0
+    real = bn._peaks
+    monkeypatch.setattr(bn, '_peaks', lambda *a, **k: [(c, r, value) for r, c, value in real(*a, **k)])
+    assert bn.main(asym_cli(query, tmp_path / 'transposed.json')) == 2  # c297774: exit 0 (centre [10, 8] reported with score 1.0)
+    assert 'accumulated map holds' in capsys.readouterr().err and not (tmp_path / 'transposed.json').exists()
+
+
+def test_self_check_fails_when_scores_are_swapped_between_rank_entries(batch_products, tmp_path, monkeypatch, capsys):
+    query_path, _, _ = batch_products
+    real = bn._peaks
+
+    def swapped(*args, **kwargs):
+        peaks = real(*args, **kwargs)
+        return [(r, c, peaks[(i + 1) % len(peaks)][2]) for i, (r, c, _) in enumerate(peaks)] if len(peaks) > 1 else peaks
+
+    monkeypatch.setattr(bn, '_peaks', swapped)
+    assert bn.main(self_check_cli(query_path, tmp_path / 'swap.json', topk='3')) == 2  # c297774: exit 0
+    assert 'accumulated map holds' in capsys.readouterr().err
+
+
+def large_origin_export(root, origin, centre):
+    path = tp.write_export(root, 'A', [('q', 'A0', (1.63, 1.97), random_masks(3))], pitch=0.1)
+    payload = json.loads(path.read_text())
+    payload['rois'][0]['frame']['origin_xy_um'] = [origin, origin]
+    payload['rois'][0]['center_xy_um'] = list(centre)
+    path.write_text(json.dumps(payload))
+    return path
+
+
+def test_self_check_geometry_tolerance_follows_the_origin_magnitude_but_stays_sub_pixel(tmp_path, monkeypatch):
+    query = large_origin_export(tmp_path / 'big', 1e7, [1e7 + 1.63, 1e7 + 1.97])
+    args = ['--query-export', str(query), '--self-check', '--max-memory-mb', '100', '--window-um', '0.8', '--topk', '4']
+    assert bn.main([*args, '--out', str(tmp_path / 'big.json')]) == 0  # c297774: exit 2 (10000000.53 vs 10000000.530000001)
+    real = bn._result_row
+
+    def one_pixel(*a, **k):
+        row = real(*a, **k)
+        row['primary'][0]['center_xy_um'][0] += 0.1
+        return row
+
+    monkeypatch.setattr(bn, '_result_row', one_pixel)
+    assert bn.main([*args, '--out', str(tmp_path / 'shift.json')]) == 2
+
+
+def test_validity_maps_are_in_the_memory_estimate_and_the_cap(tmp_path):
+    def exports(n_sets):
+        e1, e2 = random_masks(3)
+        rows = [(f'r{i}', f'B{i}', (8.0, 8.0), (e1, e2)) for i in range(n_sets)]
+        path = tp.write_export(tmp_path / f's{n_sets}', 'B', rows)
+        payload = json.loads(path.read_text())
+        for i, row in enumerate(payload['rois']):  # every ROI contributes to its own layer: n distinct contributor sets
+            for k in range(2):
+                row['endpoints'][k]['actual_layer'] = f'M{i}'
+                row['source_assets']['layouts'][k]['endpoint'] = dict(row['endpoints'][k])
+            row['analysis_layer'] = f'M{i}'
+        path.write_text(json.dumps(payload))
+        return load_export(path)
+
+    few, many = exports(1), exports(4)
+    base = run_baseline_batch(few, few, window_um=4.0, topk=1)
+    grown = run_baseline_batch(many, many, window_um=4.0, topk=1)
+    assert base['validity_map_count'] == 1 and grown['validity_map_count'] == 4
+    assert grown['validity_map_bytes'] == 4 * N * N and base['validity_map_bytes'] == N * N
+    assert grown['memory_estimate_bytes'] - base['memory_estimate_bytes'] >= grown['validity_map_bytes'] - base['validity_map_bytes']
+    one_fft = base['memory_estimate_bytes'] - 3 * N * N  # one layer unit without its validity map and construction temporaries
+    with pytest.raises(ContractError, match='memory_estimate_exceeds_limit'):  # c297774: no error (the maps were not counted)
+        run_baseline_batch(many, many, window_um=4.0, topk=1, max_memory_mb=(one_fft + 6 * N * N - 1) / 2 ** 20)
+    assert run_baseline_batch(many, many, window_um=4.0, topk=1, max_memory_mb=(one_fft + 6 * N * N) / 2 ** 20)['status'] == 'available'
