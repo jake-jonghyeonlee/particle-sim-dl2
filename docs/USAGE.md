@@ -12,7 +12,7 @@ DL2는 사용자가 고른 **검토 위치(ROI) 하나**와 국부 구조가 비
 
 | 순서 | 하는 일 | 명령 | 만들어지는 것 |
 |---|---|---|---|
-| 0 | 설치 | `uv pip install` | `.venv` |
+| 0 | 설치 | `uv pip install` / GPU: `scripts/setup_gpu_venv.sh` (2.1) | `.venv` / `.venv-gpu` |
 | 1 | ROI 목록 내보내기 | `simcompare export-review-rois` (수치 저장소) | `review_rois.json` |
 | 2 | 설정 파일 준비 | (사용자) | 실행 설정, lineage, split, cohort |
 | 3 | ROI 목록 검증 | `python -m psdl2.data` | 요약 JSON |
@@ -36,24 +36,132 @@ uv pip install --no-index --find-links /approved/wheels -e .
 
 `requirements.lock`은 개발 기기(macOS)에 설치된 버전 기록이다. 폐쇄망 OS에 맞는 wheel로 같은 버전을 설치한다.
 
-### 2.1 GPU 환경 (Windows, pip mirror)
+### 2.1 GPU 환경 (Windows 폐쇄망, GTX 1660 Super)
 
-DL1과 같은 torch 빌드(`2.7.1+cu118`)를 쓴다. psdl2는 `torch>=2.7.1`이면 되고, numpy·Pillow 버전은 DL1과 같다.
-기존 venv는 건드리지 않고 새 venv를 만든다(Git Bash).
+기준 PC는 Windows, GTX 1660 Super 6 GB, RAM 16 GB다. DL1과 같은 torch 빌드(`2.7.1+cu118`)를 쓴다.
+psdl2는 `torch>=2.7.1`이면 되고 numpy·Pillow 버전은 DL1과 같다. 명령은 **Git Bash**에서 실행한다(PowerShell 불필요).
+기존 venv(DL1 포함)는 건드리지 않고 DL2 전용 새 venv `.venv-gpu`를 만든다.
+
+#### 처음 한 번: 순서
 
 ```bash
+# 1) 코드 받기
+cd /d/work/particle-sim-dl2          # 실제 checkout 경로로 바꾼다
+git pull
+
+# 2) 드라이버 확인: GPU 이름과 "CUDA Version"(11.8 이상)이 보여야 한다
+nvidia-smi
+
+# 3) pip mirror 지정. DL1 설치 때 쓴 값과 같다. 모르면 DL1 venv에서 찾는다:
+#    <DL1 venv>/Scripts/python.exe -m pip config list -v
 export PIP_INDEX_URL=http://<mirror>/simple PIP_TRUSTED_HOST=<mirror-host>
-bash scripts/setup_gpu_venv.sh .venv-gpu        # +cu118 wheel이 다른 index에 있으면 TORCH_INDEX_URL 지정
+#    +cu118 wheel이 다른 index에 있으면 추가로:
+# export TORCH_INDEX_URL=http://<cu118-mirror>/simple
+
+# 4) GPU venv 만들기 (이미 같은 이름의 폴더가 있으면 지우지 않고 멈춘다)
+bash scripts/setup_gpu_venv.sh .venv-gpu
+
+# 5) 설치 확인: CUDA 시험까지 실행된다(개발 Mac에는 GPU가 없어 이 시험은 여기서 처음 돈다)
+PY=.venv-gpu/Scripts/python.exe
+"$PY" -m pytest -p no:warnings -rs tests/test_device.py
+"$PY" -m pytest -p no:warnings                     # 전체 시험
 ```
 
-스크립트는 CUDA 빌드 여부, GPU 이름·메모리, psdl2 CNN forward 한 번을 확인한다. CPU 빌드가 깔리면 실패로 끝난다.
-학습·색인·검색에 `--device cuda`를 붙인다. CUDA를 쓸 수 없으면 CPU로 넘어가지 않고 종료 코드 2로 멈춘다.
+4)가 정상이면 마지막에 다음과 비슷한 줄이 나온다.
 
-기준 PC는 GTX 1660 Super 6 GB, RAM 16 GB다. 모델이 작아 GPU 메모리보다 RAM(원본 mask)이 먼저 한계가 된다.
+```text
+python 3.12.x | torch 2.7.1+cu118 | cuda build 11.8 | numpy 2.5.3 | Pillow 12.3.0
+cuda available: True
+device: NVIDIA GeForce GTX 1660 SUPER | memory 6.0 GiB
+psdl2 encoder CNN forward on cuda (2, 32)
+Done. Run with --device cuda, ...
+```
+
+5)의 `tests/test_device.py`에서 `test_cuda_training_checkpoint_loads_on_cpu_and_cuda`가 **passed**여야 한다.
+`SKIPPED ... CUDA device not available`이면 GPU가 잡히지 않은 것이다(아래 문제 해결).
+
+#### 이후: 코드 갱신
+
+`.venv-gpu`에는 이 checkout이 editable로 설치돼 있어 `git pull`만 하면 새 코드가 바로 쓰인다.
+`pyproject.toml`의 의존성이 바뀐 경우에만 새 이름으로 venv를 다시 만든다(`bash scripts/setup_gpu_venv.sh .venv-gpu2`).
+
+#### 실행 (Git Bash)
+
+4장 명령의 `.venv/bin/python`을 `$PY`로 바꾸고 `--device cuda`를 붙인다. 경로는 실제 위치로 바꾼다.
+
+```bash
+PY=.venv-gpu/Scripts/python.exe
+
+# 검증: 메모리 사용량 확인(asset_memory.decoded_bytes)
+"$PY" -m psdl2.data /d/dl2/review_rois.json --assets-root /d/dl2/original_assets \
+  --max-asset-memory-mb 8000
+
+# 학습
+"$PY" -m psdl2.train /d/dl2/review_rois.json --assets-root /d/dl2/original_assets \
+  --config /d/dl2/config.json --lineages /d/dl2/lineages.json --split /d/dl2/split.json \
+  --out /d/dl2/runs/dl2.pt --device cuda --max-asset-memory-mb 8000
+
+# 색인, 검색
+"$PY" -m psdl2.index /d/dl2/candidates/review_rois.json --assets-root /d/dl2/original_assets \
+  --checkpoint /d/dl2/runs/dl2.pt --out /d/dl2/runs/dl2_index.json --device cuda --max-asset-memory-mb 8000
+"$PY" -m psdl2.search /d/dl2/query/review_rois.json --assets-root /d/dl2/original_assets \
+  --roi-id <roi_id> --checkpoint /d/dl2/runs/dl2.pt --index /d/dl2/runs/dl2_index.json \
+  --cohort /d/dl2/cohort.json --topk 10 --out /d/dl2/runs/dl2_search.json --device cuda
+```
+
+- `--device`는 `train`, `index`, `search`에만 있다. 생략하면 `cpu`다. `cuda`를 줬는데 쓸 수 없으면 CPU로 넘어가지 않고
+  종료 코드 2(`cuda_device_unavailable`)로 즉시 멈춘다.
+- GPU에서 만든 checkpoint는 CPU로, CPU에서 만든 것은 GPU로 읽고 이어서 학습할 수 있다. 다만 GPU에서 저장한
+  checkpoint를 GPU 없는 PC에서 `--resume`하면 CUDA 난수 상태를 복원할 수 없어 오류가 난다(색인·검색은 된다).
+- GPU 결과는 CPU와 소수점 아래 자리에서 다를 수 있다. 같은 결과를 비교할 때는 같은 장치로 실행한다.
+- `psdl2.baseline_ncc`(NCC 기준선)는 GPU를 쓰지 않는다. 그 메모리 상한은 별도 인수 `--max-memory-mb`다(4장 9b).
+
+#### 메모리(6 GB GPU, 16 GB RAM)
+
+모델이 작아 GPU 메모리보다 **RAM**(원본 mask)이 먼저 한계가 된다.
+
 - 1660 Super는 tensor core가 없어 혼합정밀 이득이 작다. fp32로 돈다.
-- 원본 mask는 같은 파일(경로·hash)을 여러 ROI가 공유하므로 제품당 layer 수만큼만 메모리에 올라간다. 검증 요약의 `asset_memory.decoded_bytes`로 확인한다.
-- `--max-asset-memory-mb N`을 주면 디코딩한 mask가 N MB를 넘기 전에 종료 코드 2로 멈춘다(행 단위 blocked가 아니라 export 전체 거부). 이 값은 남아 있는 mask만 센다. 파일 바이트·디코딩 중간 배열은 따로 잠깐 더 쓰므로 RAM 전체보다 넉넉히 작게 준다. 16 GB에서는 8000 정도에서 시작해 `decoded_bytes`를 보고 조정한다(실측 전 제안값).
-- GPU 결과는 CPU와 소수점 아래에서 다를 수 있다. 같은 checkpoint는 어느 쪽에서도 읽힌다.
+- 원본 mask는 같은 파일(경로·hash)을 여러 ROI가 공유하므로 제품당 layer 수만큼만 메모리에 올라간다.
+  검증 요약의 `asset_memory`로 확인한다: `decoded_assets`(디코딩한 파일 수), `asset_references`(ROI가 참조한 횟수),
+  `decoded_bytes`(남아 있는 mask 바이트), `max_bytes`(상한).
+- `--max-asset-memory-mb N`(`data`, `train`, `index`, `search`)을 주면 디코딩한 mask가 N MB를 넘기 전에 종료 코드 2
+  (`asset_memory_limit_exceeded`)로 멈춘다. 행 단위 blocked가 아니라 export 전체 거부다. 이 값은 남아 있는 mask만 센다.
+  파일 바이트·디코딩 중간 배열은 잠깐 더 쓰므로 RAM 전체보다 넉넉히 작게 준다.
+  16 GB에서는 8000으로 시작해 `decoded_bytes`를 보고 조정한다(실측 전 제안값).
+- GPU 사용량은 학습 진행 줄의 `cuda_max_allocated_mb`로 본다. 6 GB(약 6000 MB)에 가까우면 `batch_size`를 줄인다.
+
+#### 학습 진행 표시
+
+학습 중 표준 오류(stderr)에 DL1과 같은 형식의 JSON 줄이 나온다. 결과 JSON은 표준 출력(stdout)에 한 줄로 따로 나온다.
+
+```text
+{"cuda_device": "NVIDIA GeForce GTX 1660 SUPER", "device": "cuda", "epochs": 20, "event": "progress", "locations": 120, "phase": "train", "start_epoch": 0, "state": "started"}
+{"batch": 7, "batches": 15, "epoch": 3, "epochs": 20, "event": "progress", "loss": 0.412345, "phase": "train", "state": "running"}
+{"cuda_max_allocated_mb": 812.4, "elapsed_s": 41.2, "epoch": 3, "epochs": 20, "event": "progress", "optimizer_steps": 15, "phase": "train", "skipped_batches": 0, "state": "epoch_completed"}
+```
+
+| state | 언제 | 주요 필드 |
+|---|---|---|
+| `started` | 학습 시작 | `device`, `cuda_device`, `locations`(학습 ROI 수), `start_epoch`(이어서 학습이면 저장된 epoch) |
+| `running` | 10초에 한 번 | `epoch`, `batch`/`batches`, `loss`(건너뛴 batch면 null) |
+| `epoch_completed` | epoch마다, checkpoint 저장 직후 | `optimizer_steps`, `skipped_batches`, `elapsed_s`, `cuda_max_allocated_mb`(CPU면 null) |
+
+`--no-progress`로 끈다. 실패하면 오류 JSON `{"error": …}`이 stderr의 **마지막 줄**이다(앞에 진행 줄이 있을 수 있다).
+로그로 남기려면 `2> runs/train_progress.jsonl`처럼 stderr를 파일로 돌린다.
+
+#### 문제 해결
+
+| 증상 | 원인 | 조치 |
+|---|---|---|
+| 설치 스크립트가 `CPU-only torch was installed`로 끝남 | mirror에 `+cu118` wheel이 없어 CPU 빌드가 깔림 | `TORCH_INDEX_URL`에 cu118 wheel이 있는 index를 지정하고 **새 이름**으로 다시 실행 |
+| `Venv already exists and was preserved` | 같은 폴더가 이미 있음 | 다른 이름을 준다(`.venv-gpu2`). 기존 폴더는 지우지 않는다 |
+| `CPython 3.12 required` | Git Bash의 `python`이 3.12가 아님 | `PYTHON=/c/.../Python312/python.exe bash scripts/setup_gpu_venv.sh .venv-gpu` |
+| `CUDA build installed but no usable GPU` 또는 시험에서 CUDA SKIPPED | 드라이버 문제 | `nvidia-smi` 확인. 드라이버가 CUDA 11.8 이상을 지원해야 한다. 그동안은 `--device cpu` |
+| pip가 패키지를 못 찾음 | mirror 주소·인증서 설정 누락 | DL1 venv에서 `pip config list -v`로 값 확인 후 `PIP_INDEX_URL`, `PIP_TRUSTED_HOST`(필요하면 `PIP_CERT`) 지정 |
+| 실행 중 종료 코드 2, `cuda_device_unavailable` | `--device cuda`인데 GPU를 못 씀 | 위 드라이버 확인. CPU로 돌리려면 `--device cpu` |
+| 종료 코드 2, `asset_memory_limit_exceeded` | 원본 mask가 상한 초과 | `psdl2.data`로 `decoded_bytes`를 확인하고 상한을 올리거나 export를 나눈다 |
+| 종료 코드 2, `resume_cuda_rng_device_unavailable` | GPU에서 저장한 checkpoint를 GPU 없는 PC에서 이어서 학습 | GPU PC에서 이어서 학습한다 |
+| `CUDA out of memory` | GPU 6 GB 초과 | config의 `batch_size`를 줄이거나 창 크기·격자를 확인 |
 
 ## 3. 입력
 

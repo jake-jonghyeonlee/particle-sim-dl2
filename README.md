@@ -1,6 +1,8 @@
 # psdl2
 
 > 한국어 사용 안내: 전체 절차와 입력·출력 형식은 **[docs/USAGE.md](docs/USAGE.md)** 에 정리되어 있습니다.
+>
+> Windows 폐쇄망 GPU(GTX 1660 Super) 설치·실행·문제 해결은 **[docs/USAGE.md §2.1](docs/USAGE.md#21-gpu-환경-windows-폐쇄망-gtx-1660-super)** 을 따르십시오.
 
 T10 provides offline `review_roi_v1` validation and original multi-layer near/wide
 ROI bundles. It preserves physical coordinates, endpoint roles and actual layers,
