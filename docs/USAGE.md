@@ -163,6 +163,21 @@ PY=.venv-gpu/Scripts/python.exe
 | 종료 코드 2, `resume_cuda_rng_device_unavailable` | GPU에서 저장한 checkpoint를 GPU 없는 PC에서 이어서 학습 | GPU PC에서 이어서 학습한다 |
 | `CUDA out of memory` | GPU 6 GB 초과 | config의 `batch_size`를 줄이거나 창 크기·격자를 확인 |
 
+### 2.2 ETX(Linux 서버) 단일 파일 실행
+
+서버에 `.py` 파일만 올릴 수 있고 명령줄 인자를 넘길 수 없을 때 쓴다. `scripts/build_single_file.py`가 `src/psdl2/*.py` 전체를 `.py` 하나로 묶는다. `baseline_ncc`·`eval_position`은 numpy와 Pillow만 있으면 되고(torch 불필요), `train`·`search`·`evaluate` 등은 torch가 필요하다. 묶음 실행 경로는 Python 3.8 이상에서 테스트했다(패키지 설치용 `requires-python`은 그대로).
+
+```bash
+.venv/bin/python scripts/build_etx_runner.py --overwrite   # bundles/etx/psdl2_job_baseline_ncc.py
+```
+
+- `bundles/etx/psdl2_job_baseline_ncc.py`는 simcompare 4회차(`candidates`) 결과로 두 방향 `baseline_ncc --all-ready`를 돌린다(정방향: `reference_export` 질의 → `target_index_export`, 역방향은 반대). 출력은 `data/dl2/ncc_r2t.json`, `ncc_t2r.json`과 검토 시트 `data/dl2/ncc_r2t_sheet/sheet.html`, `ncc_t2r_sheet/sheet.html`이다.
+- 맨 위 EDIT 블록(`JOBS`, `LOG_FILE`, `WORK_DIR`, `BASE_DIR`)만 고친다. 상대 경로는 `BASE_DIR`(없으면 실행기 `.py`가 있는 폴더) 기준이며 simcompare 실행기와 같은 작업 폴더를 쓴다. `/data`처럼 `/`로 시작하면 절대 경로다. 로그 첫 줄에 기준 폴더, 둘째 줄에 Python·numpy·Pillow·torch 버전과 쓰인 `psdl2` 위치가 나온다.
+- 종료 코드 0·3이면 다음 작업으로 넘어가고, 그 밖이면 멈춘다.
+- `--allow-unversioned-producer`: ETX 실행기로 만든 simcompare export는 git checkout이 아니어서 `producer_commit`이 없고 `producer_commit_reason`만 있다. 이 플래그 없이는 `producer_commit_required`로 거부된다.
+- `--window-um`, `--topk`, `--max-memory-mb`(20, 4, 8000)는 예시 값이다. `--sheet-dir`는 없거나 빈 폴더여야 한다.
+- 다음 단계: 시트를 보고 `decisions.csv`를 쓴 뒤 simcompare 5회차(`confirm-pairs`)로 간다(simcompare `docs/usage.md` ETX 절).
+
 ## 3. 입력
 
 ### 3.1 ROI 목록 `review_rois.json` — schema `review_roi_v1`

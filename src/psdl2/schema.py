@@ -1,4 +1,6 @@
 """Explicit geometry and recipe contracts for original-layout ROI consumers."""
+from __future__ import annotations
+
 from dataclasses import dataclass
 import math
 from pathlib import Path, PureWindowsPath
@@ -40,7 +42,11 @@ def safe_path(root, relative):
         raise ContractError('unsafe_asset_path')
     root = Path(root).resolve()
     resolved = (root / p).resolve()
-    if not resolved.is_relative_to(root) or not resolved.is_file():
+    try:
+        resolved.relative_to(root)  # Path.is_relative_to는 3.9+
+    except ValueError:
+        raise ContractError('missing_or_escaping_asset_path') from None
+    if not resolved.is_file():
         raise ContractError('missing_or_escaping_asset_path')
     return resolved
 

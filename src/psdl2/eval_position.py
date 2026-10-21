@@ -9,6 +9,8 @@ the learned model and the non-learned baseline are compared on identical terms.
 This measures position recovery with tens of labels; it is not a statistical
 performance claim, and no producer module is imported (JSON only).
 """
+from __future__ import annotations
+
 import argparse
 import json
 import math

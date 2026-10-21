@@ -1,4 +1,6 @@
 """Atomic, fingerprinted local checkpoints with optimizer and RNG resume."""
+from __future__ import annotations
+
 import hashlib
 import json
 import os

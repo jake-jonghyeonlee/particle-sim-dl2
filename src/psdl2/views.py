@@ -1,4 +1,6 @@
 """Exact common-core joint graph, a geometric contact proxy, not physical nets."""
+from __future__ import annotations
+
 from copy import deepcopy
 from dataclasses import dataclass, replace
 

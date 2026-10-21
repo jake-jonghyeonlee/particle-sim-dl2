@@ -10,6 +10,8 @@ identical terms. Exact source pixels, no resampling, no training. An empty or
 structureless template is reported, never guessed. Nothing here is a similarity,
 registration or risk claim.
 """
+from __future__ import annotations
+
 import argparse
 from fractions import Fraction
 import hashlib
@@ -536,10 +538,15 @@ def run_baseline_batch(query_export, index_export, **kwargs):
     return _run_batch(query_export, index_export, **kwargs)[0]
 
 
+def _ulp(value):
+    """math.ulp(3.9+)와 같은 값. 3.8에서는 numpy.spacing(양수 float64의 다음 수까지 간격)을 쓴다."""
+    return math.ulp(value) if hasattr(math, 'ulp') else float(np.spacing(np.float64(abs(value))))
+
+
 def _geometry_tolerance(pitch, magnitudes):
     """Float-versus-exact geometry tolerance: 16 ULPs of the largest coordinate involved (the matcher adds terms of that size in
     float64), never below 1e-9 um and never above a thousandth of the pixel pitch, so a pixel-scale error cannot hide at any origin."""
-    ulps = 16 * math.ulp(max(abs(float(m)) for m in magnitudes))
+    ulps = 16 * _ulp(max(abs(float(m)) for m in magnitudes))
     return min(max(1e-9, ulps), float(pitch) * 1e-3)
 
 

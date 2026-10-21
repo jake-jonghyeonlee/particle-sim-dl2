@@ -1,4 +1,6 @@
 """Local embedding index preserving case bindings, physical frames and coverage."""
+from __future__ import annotations
+
 import argparse
 from copy import deepcopy
 import json

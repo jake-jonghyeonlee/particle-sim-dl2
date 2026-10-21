@@ -1,4 +1,6 @@
 """Lineage and physical-overlap groups; caller explicitly assigns each group."""
+from __future__ import annotations
+
 from .schema import ContractError, text
 
 

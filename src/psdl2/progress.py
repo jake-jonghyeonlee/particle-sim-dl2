@@ -1,4 +1,6 @@
 """Progress JSON lines on stderr, same format as DL1: {"event": "progress", "phase": ..., ...}."""
+from __future__ import annotations
+
 import json
 import sys
 import time

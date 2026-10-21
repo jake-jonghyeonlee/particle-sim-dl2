@@ -5,6 +5,8 @@ One PNG per query template and per top-K match window plus a single self-contain
 score only orders and labels the page (S4), nothing is accepted or dropped here. Pixels are written
 exactly as they are in the layout union: no resampling, the browser only magnifies them.
 """
+from __future__ import annotations
+
 import html
 import io
 import os
@@ -179,7 +181,8 @@ def write_sheet(sheet_dir, entries, *, window_um, topk):
             parts.append(f'<p>매칭 불가: {html.escape(", ".join(entry["reasons"]))}</p>')
             continue
         files[f'{stem}_query.png'] = _png(entry['query_crop'])
-        parts.append(f'<table><tr><th>질의 템플릿</th>{"".join(f"<th>순위 {m["rank"]}</th>" for m in entry["matches"])}</tr><tr>')
+        rank_headers = ''.join('<th>순위 {}</th>'.format(m['rank']) for m in entry['matches'])  # 3.12 이전 f-string 호환
+        parts.append(f'<table><tr><th>질의 템플릿</th>{rank_headers}</tr><tr>')
         parts.append(f'<td><img src="{stem}_query.png" alt="질의 템플릿"></td>')
         for match in entry['matches']:
             name = f'{stem}_m{match["rank"]:02d}.png'

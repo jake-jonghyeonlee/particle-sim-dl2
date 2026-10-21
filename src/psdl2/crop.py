@@ -3,6 +3,8 @@
 No quantitative CA is measured here. Resampling uses nearest source cell at each
 output cell centre, with exact configured physical extents and a common transform.
 """
+from __future__ import annotations
+
 from copy import deepcopy
 from dataclasses import asdict, dataclass
 import math

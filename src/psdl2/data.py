@@ -1,4 +1,6 @@
 """Offline review_roi_v1 validation; producer files are the sole exchange interface."""
+from __future__ import annotations
+
 import argparse
 from copy import deepcopy
 from dataclasses import dataclass

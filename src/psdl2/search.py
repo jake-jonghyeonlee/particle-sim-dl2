@@ -1,4 +1,6 @@
 """Case-compatible cosine search with a fixed primary cohort and separate expansion."""
+from __future__ import annotations
+
 import argparse
 from copy import deepcopy
 import json

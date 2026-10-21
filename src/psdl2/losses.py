@@ -1,4 +1,6 @@
 """Label-free alignment/variance/covariance with an optional known-pair term."""
+from __future__ import annotations
+
 from dataclasses import dataclass
 import json
 from pathlib import Path

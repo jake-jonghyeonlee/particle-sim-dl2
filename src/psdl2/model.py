@@ -1,4 +1,6 @@
 """Small local-only shared CNN over an electrode-layer set and two physical scales."""
+from __future__ import annotations
+
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
