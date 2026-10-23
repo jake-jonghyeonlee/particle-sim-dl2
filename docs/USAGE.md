@@ -21,6 +21,8 @@ DL2는 사용자가 고른 **검토 위치(ROI) 하나**와 국부 구조가 비
 | 6 | 검색 | `python -m psdl2.search` | 검색 결과 JSON |
 | 7 | 평가(정답이 있을 때) | `python -m psdl2.evaluate` | 평가 JSON |
 
+여러 제품을 한 학습·색인에 넣고 무작위 patch로 학습하는 절차는 [4.1](#41-여러-제품무작위-patch-절차-psdl2_dataset_v1)에 있다. 위 표의 1단계 대신 `export-template-rois`(hotspot를 열지 않음)를 쓰고, 4–6단계는 `--dataset` / `--query-dataset`으로 돌린다.
+
 ROI는 `particle-sim-compare`가 만든다. 전극 수 지도에서 고른 영역이나 사용자가 직접 지정한 좌표가 출처다. DL2 검색 결과가 자동으로 새 ROI를 만들지는 않는다.
 
 ## 2. 설치
@@ -409,6 +411,81 @@ DL1이 고른 비교군 제품 id 목록이다. 검색의 주 결과는 이 제�
 | 0 | 정상 |
 | 2 | 입력·설정 오류. 표준 오류에 `{"error": …}`가 나온다 |
 | 3 | 실행은 됐지만 결과가 온전하지 않음. 검증: blocked 또는 제외된 행이 하나라도 있음. 색인: 색인된 ROI가 0건. 검색: `status`가 `unavailable`. 평가: 정답이 없거나 계산할 query가 없음 |
+
+### 4.1 여러 제품·무작위 patch 절차 (`psdl2_dataset_v1`)
+
+학습 위치를 사람이 고른 ROI 몇 개가 아니라 **형상 기준으로 DL2가 만든 patch**로 하고, 여러 제품을 한 학습·한 색인에 넣는 절차다. 수치(N, 간격, 격자 step, 반복 주기)에는 기본값이 없다. 실행 때마다 명시한다. 아래 순서의 실제 예는 `tests/test_e2e_dataset.py`다(합성 3제품·3계열).
+
+| 순서 | 하는 일 | 명령 | 만들어지는 것 |
+|---|---|---|---|
+| A | template export (제품마다) | `simcompare export-template-rois` (수치 저장소, `docs/template_export.md`) | `roi/review_rois.json`, `roi/mask_derivation.json` |
+| B | dataset manifest 쓰기 | (사용자) | `psdl2_dataset_v1` JSON (아래 스키마) |
+| C | 학습용 random patch | `python -m psdl2.patches --mode random` | `psdl2_patch_set_v1` (제품마다) |
+| D | 색인용 grid patch | `python -m psdl2.patches --mode grid` | `psdl2_patch_set_v1` (제품마다) |
+| E | 분할 | `python -m psdl2.make_split` | `split.json` |
+| F | 학습 | `python -m psdl2.train --dataset` | checkpoint |
+| G | 색인 | `python -m psdl2.index --dataset` | index JSON(`sources[]`) |
+| H | 검색 | `python -m psdl2.search --query-dataset` | 검색 결과 JSON |
+| I | 위치 평가 | `python -m psdl2.eval_position` | 평가 JSON |
+
+```bash
+# A) 제품마다 (수치 저장소). 1.png/2.png(처리 마스크)만 읽고 hotspot는 열지 않는다
+simcompare export-template-rois --config template_A.yaml --out exports/prodA
+
+# B) dataset.json — 상대 경로는 이 파일의 위치 기준. mask_derivation은 인라인 객체 또는 파일 경로
+#    {"schema_version": "psdl2_dataset_v1", "sources": [
+#       {"export": "exports/prodA/roi/review_rois.json", "export_sha256": "<sha256>",
+#        "assets_root": "exports/prodA/data", "mask_derivation": "exports/prodA/roi/mask_derivation.json",
+#        "patch_sets": []}, ...]}
+#    patch_sets가 비어 있지 않은 source는 template 행이 빠지고 patch 행만 들어간다.
+
+# C) 학습용 random patch: case(= ready manual template 행)마다 N개. --source는 manifest의 source 번호
+python -m psdl2.patches --dataset dataset.json --source 0 --config config.json --mode random \
+  --seed 3 --per-case 200 --min-spacing-um 5 [--repeat-period-um 40 [40]] [--allow-shortage] --out patches/random_A.json
+#    N을 채우지 못하면 종료 코드 2(파일 없음, stderr에 case별 깔때기). --allow-shortage는 부족을 헤더에 기록하고 쓴다(전부 0개면 여전히 2).
+
+# D) 색인용 grid patch: frame origin + (i·step, j·step) 중 위치 조건을 통과한 점 전부
+python -m psdl2.patches --dataset dataset.json --source 0 --config config.json --mode grid \
+  --grid-step-um 2 [--coverage-labels pairs_ids.json] --out patches/grid_A.json
+#    격자 간격은 평가의 hit 허용 거리 이하로 잡는다. --coverage-labels를 주면 정답 위치마다 가장 가까운 격자점 거리를 보고한다.
+
+# 제품마다 C·D를 반복한 뒤 patch set 파일을 manifest의 patch_sets에 적어 학습용(random)·색인용(grid) manifest를 따로 둔다.
+
+# E) 제품 → 계열(lineages.json)과 계열 → 구획(assign.json)에서 split.json을 만든다. 누수가 있으면 오류
+python -m psdl2.make_split --dataset train_dataset.json --config config.json \
+  --lineages lineages.json --assign assign.json --out split.json
+#    assign.json 예: {"lineage_0": "train", "lineage_1": "validation", "lineage_2": "test"}
+
+# F) 학습. export 인자 대신 --dataset (둘 다/둘 다 없음은 오류). --assets-root는 쓰지 않는다
+python -m psdl2.train --dataset train_dataset.json --config config.json --lineages lineages.json \
+  --split split.json --out runs/dl2.pt --max-asset-memory-mb 8000
+
+# G) 색인: grid patch dataset 전체
+python -m psdl2.index --dataset index_dataset.json --checkpoint runs/dl2.pt --out runs/dl2_index.json
+
+# H) 검색: query는 기존 query export를 감싼 manifest(query 쪽 mask_derivation 포함). 학습에 없는 계열의 ROI를 쓴다
+python -m psdl2.search --query-dataset query_dataset.json --roi-id roi_aaa… --checkpoint runs/dl2.pt \
+  --index runs/dl2_index.json --cohort cohort.json --topk 50 --out runs/dl2_search.json
+#    [--ignore-mask-derivation] 을 주면 derivation 비교를 생략하고 결과에 "mask_derivation_comparison": "ignored"를 남긴다
+
+# I) 위치 평가 (4절 8번과 같다)
+python -m psdl2.eval_position --search runs/dl2_search.json --correspondence pairs_ids.json \
+  --hit-tolerance-um 5 --k 50 --out runs/eval_dl2.json
+
+# 기준선: baseline_ncc는 dataset을 받지 않는다. 같은 cohort의 template export(patch가 아닌 review_rois.json)를 기존 인터페이스로 준다
+python -m psdl2.baseline_ncc --query-export query/review_rois.json --index-export exports/prodA/roi/review_rois.json \
+  --correspondence pairs_ids.json --window-um 20 --topk 50 --out runs/baseline.json
+python -m psdl2.eval_position --baseline runs/baseline.json --correspondence pairs_ids.json \
+  --hit-tolerance-um 5 --k 50 --out runs/eval_baseline.json
+```
+
+알아 둘 점:
+
+- **처리 마스크.** 1.png/2.png는 case별 처리 마스크다(위쪽 전극은 중간 layer를 뺀 것, lateral은 그대로). 의미와 `mask_derivation`은 [data_contract.md](data_contract.md) “Processed masks”에 있다.
+- **검색 호환.** query와 후보의 `mask_derivation`(규칙 버전, 처리 endpoint, 제거 layer 목록)이 같아야 한다. 다르면 `mask_derivation_mismatch`, 한쪽만 있으면 `mask_derivation_unknown`으로 제외하고 `rejected`에 이유가 남는다. 표는 [training.md](training.md)에 있다.
+- **patch 좌표 조건과 preflight는 다르다.** 생성기는 창 전체가 frame 안인지, core가 전부 valid인지, anchor가 있는지 본다. 학습의 사전 검사(`views.preflight`)는 그것을 보지 않는다.
+- **종료 코드.** patches: 0 정상, 2 오류·부족(종료 코드 3은 쓰지 않는다). make_split: 0 / 2. 그 외는 위 표와 같다.
+- **ETX 실행기.** 2.2의 단일 파일 실행기 작업은 `baseline_ncc`뿐이다. 이 절차의 명령(`patches`, `make_split`, `train --dataset` 등)은 `python -m psdl2.<모듈>`로 돌린다.
 
 ## 5. 출력
 

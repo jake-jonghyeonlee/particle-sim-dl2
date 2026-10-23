@@ -13,7 +13,7 @@ import numpy as np
 import torch
 
 from .checkpoint import fingerprint, load_checkpoint, save_checkpoint
-from .data import load_export
+from .data import load_dataset, load_export
 from .losses import LossConfig, objective, read_labels, relation_matrix, validate_label_ids
 from .model import Encoder, ModelConfig, resolve_device
 from .progress import Progress, stderr_sink
@@ -75,7 +75,7 @@ def paired_forward(model, rois, view_config, loss_config, rng, *, labels=None):
 
 
 def train(rois, config, output, *, lineages, assignments, labels=None, resume=None, device='cpu',
-          progress_sink=None, progress_interval=10.0):
+          progress_sink=None, progress_interval=10.0, dataset=None):
     device = resolve_device(device)
     progress = Progress(progress_sink, progress_interval)
     view_config = ViewConfig.from_dict(config['views'])
@@ -95,6 +95,9 @@ def train(rois, config, output, *, lineages, assignments, labels=None, resume=No
     accepted = {**semantic_config, 'training_records': records, 'split': assignments,
                 'source_versions': [r.versions for r in rois],
                 'source_assets': [r.row['source_assets'] for r in rois], 'labels': labels}
+    if dataset is not None:
+        # Dataset mode only: single-export fingerprints stay byte-identical.
+        accepted['dataset'] = dataset.fingerprint
     random.seed(config['seed']); np.random.seed(config['seed']); torch.manual_seed(config['seed'])
     rng = np.random.default_rng(config['seed'])
     model = Encoder(ModelConfig(**config['model'])).to(device)
@@ -164,7 +167,8 @@ def train(rois, config, output, *, lineages, assignments, labels=None, resume=No
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description='Train label-free DL2 on explicit original ROI views offline.')
-    parser.add_argument('export', type=Path); parser.add_argument('--assets-root', type=Path)
+    parser.add_argument('export', type=Path, nargs='?'); parser.add_argument('--assets-root', type=Path)
+    parser.add_argument('--dataset', type=Path, help='psdl2_dataset_v1 manifest instead of a single export')
     parser.add_argument('--config', required=True, type=Path); parser.add_argument('--out', required=True, type=Path)
     parser.add_argument('--lineages', required=True, type=Path, help='JSON product_id -> lineage_id mapping')
     parser.add_argument('--split', required=True, type=Path, help='JSON roi_id -> train/validation/test mapping')
@@ -177,13 +181,25 @@ def main(argv=None):
     args = parser.parse_args(argv)
     try:
         resolve_device(args.device)  # fail before the slow export load
-        export = load_export(args.export, assets_root=args.assets_root,
-                             allow_unversioned_producer=args.allow_unversioned_producer,
-                             max_asset_memory_mb=args.max_asset_memory_mb)
-        result = train(export.ready, read_config(args.config), args.out,
+        dataset = None
+        if (args.export is None) == (args.dataset is None):
+            raise ContractError('exactly_one_of_export_or_dataset_required')
+        if args.dataset is not None:
+            if args.assets_root is not None:
+                raise ContractError('assets_root_not_allowed_with_dataset')
+            config = read_config(args.config)
+            export = dataset = load_dataset(args.dataset, expected_views=ViewConfig.from_dict(config['views']),
+                                            allow_unversioned_producer=args.allow_unversioned_producer,
+                                            max_asset_memory_mb=args.max_asset_memory_mb)
+        else:
+            export = load_export(args.export, assets_root=args.assets_root,
+                                 allow_unversioned_producer=args.allow_unversioned_producer,
+                                 max_asset_memory_mb=args.max_asset_memory_mb)
+            config = read_config(args.config)
+        result = train(export.ready, config, args.out,
                        lineages=json.loads(args.lineages.read_text()), assignments=json.loads(args.split.read_text()),
                        labels=None if args.labels is None else read_labels(args.labels), resume=args.resume,
-                       device=args.device, progress_sink=None if args.no_progress else stderr_sink)
+                       device=args.device, progress_sink=None if args.no_progress else stderr_sink, dataset=dataset)
         print(json.dumps(result, allow_nan=False)); return 0
     except (ContractError, ValueError, KeyError, TypeError, OSError) as exc:
         print(json.dumps({'error': str(exc), **({'statistics': exc.statistics} if hasattr(exc, 'statistics') else {})}), file=sys.stderr); return 2

@@ -35,19 +35,65 @@ def groups(records):
         from .schema import number
         if len(bbox) != 4 or any(number(v) != v for v in bbox) or bbox[0] >= bbox[2] or bbox[1] >= bbox[3]:
             raise ContractError('valid_split_bbox_required')
-    parents = list(range(len(records)))
+    result, _ = _components(records)
+    return result
+
+
+def _freeze(value):
+    """Hashable key with the same equality as ``==`` on JSON-like values (1 == 1.0, list != tuple)."""
+    if isinstance(value, dict):
+        return ('d', frozenset((k, _freeze(v)) for k, v in value.items()))
+    if isinstance(value, list):
+        return ('l', tuple(_freeze(v) for v in value))
+    if isinstance(value, tuple):
+        return ('t', tuple(_freeze(v) for v in value))
+    return value
+
+
+def _components(records):
+    """Connected components of ``_related`` without the all-pairs scan; returns (groups, stats).
+
+    Lineage and augmentation links are global hash unions. Overlap is only tested inside a bucket whose
+    (product_id, design_version, complete frame) are equal, by an x-sweep, so no pair that ``_related``
+    could link is skipped.
+    """
+    n = len(records)
+    parents = list(range(n))
     def find(i):
         while parents[i] != i:
             parents[i] = parents[parents[i]]; i = parents[i]
         return i
-    for i, a in enumerate(records):
-        for j in range(i):
-            if _related(a, records[j]):
-                parents[find(i)] = find(j)
-    result = {}
+    def union(i, j):
+        parents[find(i)] = find(j)
+    for field in ('lineage_id', 'augmentation_of'):
+        first = {}
+        for i, r in enumerate(records):
+            j = first.setdefault(r[field], i)
+            if j != i:
+                union(i, j)
+    buckets = {}
+    for i, r in enumerate(records):
+        buckets.setdefault(_freeze((r['product_id'], r['design_version'], r['frame'])), []).append(i)
+    comparisons = 0
+    for members in buckets.values():
+        members.sort(key=lambda i: records[i]['bbox_xyxy_um'][0])
+        active = []
+        for i in members:
+            x0, y0, _, y1 = records[i]['bbox_xyxy_um']
+            active = [j for j in active if records[j]['bbox_xyxy_um'][2] > x0]
+            for j in active:
+                if find(i) == find(j):
+                    continue  # already one component; the pair cannot change the result
+                comparisons += 1
+                _, v0, _, v1 = records[j]['bbox_xyxy_um']
+                if max(y0, v0) < min(y1, v1):
+                    union(i, j)
+            active.append(i)
+    grouped = {}
     for i, record in enumerate(records):
-        result.setdefault(find(i), []).append(record['roi_id'])
-    return sorted([sorted(group) for group in result.values()])
+        grouped.setdefault(find(i), []).append(record['roi_id'])
+    stats = {'records': n, 'buckets': len(buckets), 'pair_comparisons': comparisons, 'all_pairs': n*(n-1)//2}
+    return sorted([sorted(group) for group in grouped.values()]), stats
 
 
 def validate_split(records, assignments):

@@ -163,3 +163,133 @@ intentionally does not require the same analysis layer or VIA count. A missing
 `producer_commit` key remains equivalent to null: explicit unversioned opt-in,
 nonempty reason and any commit-pin checks still apply; no admission rule changed.
 Legacy v2-policy checkpoint/index inputs are rejected, with no automatic migration.
+
+
+## Processed masks and `mask_derivation` (Q8)
+
+`1.png` / `2.png` of a case folder are **case-processed masks**, not raw per-layer layout.
+For a vertical case the upper electrode's mask has the layers lying *between* the two endpoint
+layers removed (`between_stack_order_v1`: every `layer_stack` layer whose `stack_order` is strictly
+between the endpoints); the lower electrode is unchanged. A lateral case removes nothing. CNT is
+the union of the DL1 `cno/*.png` of the product, shared by all cases; VIA is not used (empty list;
+layers connected through VIA are already one electrode). The export does not mark these masks as
+processed, because the producer cannot know it: the fact is a user premise, recorded here and in
+`mask_derivation`. Existing exports are never rewritten to carry it.
+
+Two products are comparable only when their masks were derived the same way, so the derivation
+travels with the data: dataset file -> `ROI.mask_derivation` (`src/psdl2/data.py:334` parse, `:562-570` attach) ->
+`case_signature['mask_derivation']` of each index record -> `search` (`src/psdl2/search.py:140-146`).
+An ROI without a derivation is *unknown*, which differs from a *known empty* one (lateral).
+
+## `psdl2_dataset_v1` — several exports as one input
+
+```json
+{"schema_version": "psdl2_dataset_v1",
+ "sources": [{"export": "prodA/roi/review_rois.json", "export_sha256": "…64 hex…",
+              "assets_root": "prodA/data", "patch_sets": ["patches/random_A.json"],
+              "mask_derivation": "prodA/roi/mask_derivation.json"}]}
+```
+
+Exact keys: top level `schema_version`, `sources`; per source `export` and `export_sha256` required,
+`assets_root`, `patch_sets` (list of paths), `mask_derivation` (inline object or path) optional.
+Relative paths resolve from the manifest's folder, never the working directory. Each source goes
+through the unchanged `load_export` checks; the export bytes must match `export_sha256`.
+`load_dataset` is `src/psdl2/data.py:502`. A source with non-empty `patch_sets` admits **only its
+patch rows**; its template rows are not admitted (their ids stay reserved for uniqueness).
+
+| Error code | Meaning |
+|---|---|
+| `unknown_dataset_schema` | not an object / wrong `schema_version` |
+| `unsupported_dataset_field` | extra top-level key |
+| `dataset_sources_required` | `sources` missing, not a list or empty |
+| `unsupported_dataset_source_field` | source lacks `export`/`export_sha256` or has an unknown key |
+| `patch_sets_list_required` | `patch_sets` is not a list of strings |
+| `patch_set_views_unchecked` | patch sets present but the caller passed no views (`expected_views=None`) |
+| `export_sha256_mismatch` | export bytes differ from the manifest |
+| `duplicate_roi_id_across_sources: <id>` | an `roi_id` (ready or blocked, template or patch) occurs twice in the dataset |
+| `duplicate_patch_set: <path>` | two listed patch-set files with identical bytes (sha256), including the same file listed twice |
+| `mask_derivation_case_missing: <roi_id>` | a ready ROI has no derivation entry (only checked when the source has a derivation) |
+| `mask_derivation_case_unreferenced: <failure_type> [endpoints]` | an entry matches no ROI (ready or blocked) of the source |
+| `cache_and_max_asset_memory_mb_exclusive` | `load_export` given both a shared cache and its own limit (programming error) |
+| `asset_memory_limit_exceeded: …` | see the memory note below |
+
+## `psdl2_mask_derivation_v1`
+
+`{"schema_version", "rule_version", "cases": [{"case": {"failure_type", "endpoints": [{electrode_id, role, actual_layer} x2]}, "processed_endpoint", "removed_layers"}]}`
+(`parse_mask_derivation`, `src/psdl2/data.py:334`). A case is matched to ROIs by `failure_type` and the
+**set** of endpoints (order does not matter). `removed_layers` is stored sorted and unique;
+`processed_endpoint` is an `electrode_id` of that case, or `null` for lateral cases (with `removed_layers: []`).
+Per ROI the record kept is `{schema_version, rule_version, processed_endpoint: {role, actual_layer} | null, removed_layers}`:
+the processed endpoint is compared by `(role, actual_layer)`, not by electrode name, because names differ between products.
+
+| Error code | Meaning |
+|---|---|
+| `mask_derivation_envelope_invalid` | not an object with exactly the three keys |
+| `unknown_mask_derivation_schema` | wrong `schema_version` |
+| `mask_derivation_cases_list_required` | `cases` not a list |
+| `mask_derivation_entry_invalid` | entry keys are not `case`, `processed_endpoint`, `removed_layers` |
+| `mask_derivation_case_invalid` | `case` keys are not `failure_type`, `endpoints` |
+| `mask_derivation_failure_type_invalid` | unknown `failure_type` |
+| `mask_derivation_two_endpoints_required` | `endpoints` is not a list of two |
+| `mask_derivation_duplicate_endpoint` | the two endpoints are identical |
+| `mask_derivation_removed_layers_list_required` | `removed_layers` not a list |
+| `mask_derivation_removed_layers_duplicate` | repeated layer name |
+| `mask_derivation_removed_layer_is_endpoint_layer` | a removed layer is one of the case's endpoint layers |
+| `mask_derivation_lateral_must_be_empty` | lateral case with a processed endpoint or removed layers |
+| `mask_derivation_processed_endpoint_required` | non-lateral case without a string `processed_endpoint` |
+| `mask_derivation_processed_endpoint_invalid` | it does not name exactly one endpoint |
+| `mask_derivation_duplicate_case` | two entries with the same failure type and endpoint set |
+| `invalid_record_mask_derivation` | an *index record's* derivation is malformed (`src/psdl2/search.py:29`): wrong keys, unsorted/duplicate layers, `processed_endpoint` null for a non-lateral case, or not one of the record's endpoints |
+
+## `psdl2_patch_set_v1` — generated positions
+
+Written by `python -m psdl2.patches` (`src/psdl2/patches.py:325`); it does not copy the export. Layout:
+`{"schema_version", "header": {generator_version, numpy_version, mode, template_export: {path, sha256}, arguments, views_fingerprint, views, cases[], ignored_template_rows[], content_sha256}, "patches": [{template_roi_id, center_xy_um, mode, roi_id}]}`.
+`roi_id = "patch_" + sha256(canonical JSON [template_roi_id, center_xy_um, mode, generator_version])[:24]`;
+`content_sha256` is the hash of the canonical document without that field (generation arguments are covered by it, not by the ids).
+`header.cases[]` records per template row the status (`complete`, `shortage`, `empty`) and the funnel
+(candidates -> repeat period -> window -> valid -> anchor -> Q1 -> preflight -> spacing -> output; `unexamined` counts candidates a random run did not need to test).
+Same inputs, arguments and seed give the same bytes. An expanded row shares the template's decoded channel arrays and differs only in
+`center_xy_um`, `roi_id` and `provenance.patch = {set_sha256, template_roi_id, mode, generator_version}`; `set_sha256` is the hash of the patch-set file bytes.
+
+| Error code (`load_dataset`, `src/psdl2/data.py:427-498`) | Meaning |
+|---|---|
+| `patch_set_missing: <path>` | file cannot be read |
+| `patch_set_envelope_invalid` | wrong top-level/header structure |
+| `unknown_patch_set_schema` | wrong `schema_version` |
+| `stale_patch_set: <path>` | its template sha256 differs from the source's `export_sha256` |
+| `patch_record_invalid` | a patch entry has other keys / wrong types |
+| `patch_template_not_ready: <id>` / `patch_template_not_manual: <id>` | the template row is not a ready `manual` row |
+| `patch_mode_invalid` | mode is not `random` or `grid` |
+| `patch_center_not_finite: <id>` | centre is NaN/inf or malformed |
+| `patch_id_mismatch: <id>` | the id is not the hash of its fields (tamper) |
+| `patch_position_outside_source_frame: <id>` / `patch_position_outside_valid_domain: <id>` | the centre fails the loader's position/valid check (only reachable by forging a re-hashed file) |
+| `patch_set_hash_mismatch: <path>` | `content_sha256` differs from the recomputed hash (header/argument tamper) |
+| `patch_set_view_config_mismatch: <path>` | views fingerprint differs from the train config / index checkpoint views |
+| `duplicate_roi_id_across_sources: <id>` | a patch id collides with another row (same set twice, overlapping sets) |
+
+Generator-side errors (exit 2, JSON on stderr): `patch_shortage` (some case has fewer than N; no file written, per-case funnel in the message),
+`no_patches_generated` (zero patches in total, also with `--allow-shortage`: an empty set is useless),
+`no_ready_manual_template_rows`, `output_exists_use_overwrite`, `export_sha256_mismatch`, `source_index_out_of_range`,
+`source_not_found_or_ambiguous`, `unknown_dataset_schema`, `explicit_<seed|per_case|min_spacing_um>_required`,
+`explicit_grid_step_um_required`, `random_arguments_not_allowed_with_grid`, `grid_step_not_allowed_with_random`,
+`allow_shortage_not_allowed_with_grid`, `coverage_labels_need_grid_mode`, `seed_must_be_nonnegative_integer`,
+`per_case_must_be_positive_integer`, `min_spacing_must_be_nonnegative`, `repeat_period_needs_one_or_two_values`.
+The patch set is published atomically (same-folder temp file, fsync, `os.replace`); an interrupted run leaves the old file unchanged.
+
+## Memory limit and generator memory
+
+`--max-asset-memory-mb` counts **retained decoded masks only** (`src/psdl2/data.py:100-118`): one read-only `uint8` array per distinct
+(resolved path, hash, value semantics, frame shape). One cache serves every source of a dataset, so the limit applies to the **sum**, and
+a file reachable by two paths is counted once. Patch rows reuse their template's arrays, so thousands of patches add nothing.
+File bytes, decode buffers, embeddings, the index and the generator's working arrays are not counted.
+
+The patch generator additionally builds integral images (about four `int64` maps) and `(ny, nx)` temporaries per template frame,
+roughly 5 x 8 x height x width bytes at peak, which `--max-asset-memory-mb` does not cover. This is fine up to a few thousand cells per side;
+for a much larger frame, leave headroom or generate from a coarser template.
+
+## `no_patches_generated`
+
+A generator run that finds no admissible position anywhere is an error, not an empty file: exit 2, JSON `{"error": "no_patches_generated", "cases": [...funnel...]}`
+on stderr, nothing written, an existing output untouched. A shortage in only some cases is `patch_shortage` (exit 2) unless `--allow-shortage`
+records it in the header and exits 0. Exit code 3 is never used, because the single-file runner treats it as "continue".

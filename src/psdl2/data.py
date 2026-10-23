@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import argparse
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import hashlib
 import io
 import json
@@ -25,6 +25,8 @@ class ROI:
     channels: dict[str, np.ndarray]
     channel_bindings: dict[str, dict]
     versions: dict
+    mask_derivation: dict | None = None  # dataset mode only; None means unknown (never an empty derivation)
+    patch: dict | None = None  # dataset mode only; provenance.patch of an expanded patch row
 
     @property
     def center_xy_um(self):
@@ -55,6 +57,13 @@ def _hash(value):
     if not isinstance(value, str) or not re.fullmatch('[0-9a-f]{64}', value):
         raise ContractError('sha256_required')
     return value
+
+
+def _memory_limit(max_asset_memory_mb):
+    if max_asset_memory_mb is not None and (isinstance(max_asset_memory_mb, bool) or not isinstance(max_asset_memory_mb, (int, float))
+                                            or not math.isfinite(max_asset_memory_mb) or not 0 < max_asset_memory_mb <= 2**40):
+        raise ContractError('max_asset_memory_mb_must_be_positive')
+    return None if max_asset_memory_mb is None else int(max_asset_memory_mb * 1024 * 1024)
 
 
 class AssetMemoryLimit(ContractError):
@@ -217,18 +226,19 @@ def _ready(row, root, versions, cache=None):
 
 
 def load_export(path, *, assets_root=None, expected_producer_commit=None, allow_unversioned_producer=False,
-                max_asset_memory_mb=None):
+                max_asset_memory_mb=None, cache=None):
     """Invalid ready rows become blocked; envelope errors reject the export.
 
     assets_root explicitly relocates the unchanged producer references. Without it,
     use the producer's original root. Asset references must stay inside that root.
     Decoded masks are shared across ROIs; ``max_asset_memory_mb`` rejects the whole
-    export before decoding would exceed it.
+    export before decoding would exceed it. A caller-supplied ``cache`` (dataset mode) is shared
+    across exports and carries its own limit.
     """
-    if max_asset_memory_mb is not None and (isinstance(max_asset_memory_mb, bool) or not isinstance(max_asset_memory_mb, (int, float))
-                                            or not math.isfinite(max_asset_memory_mb) or not 0 < max_asset_memory_mb <= 2**40):
-        raise ContractError('max_asset_memory_mb_must_be_positive')
-    cache = AssetCache(None if max_asset_memory_mb is None else int(max_asset_memory_mb * 1024 * 1024))
+    if cache is not None and max_asset_memory_mb is not None:
+        raise ContractError('cache_and_max_asset_memory_mb_exclusive')
+    if cache is None:
+        cache = AssetCache(_memory_limit(max_asset_memory_mb))
     path = Path(path)
     payload = json.loads(path.read_text(encoding='utf-8'))
     if payload.get('schema_version') != SCHEMA_VERSION:
@@ -295,6 +305,303 @@ def load_export(path, *, assets_root=None, expected_producer_commit=None, allow_
             row['reasons'].append(str(exc) if isinstance(exc, ContractError) else 'invalid_original_source_record')
             blocked.append(row)
     return Export(tuple(ready), tuple(blocked), tuple(deepcopy(excluded)), versions, cache.report())
+
+
+DATASET_SCHEMA = 'psdl2_dataset_v1'
+DERIVATION_SCHEMA = 'psdl2_mask_derivation_v1'
+_FAILURE_TYPES = ('lateral_short', 'vertical_short')
+
+
+@dataclass(frozen=True)
+class Dataset:
+    """Ready/blocked rows of every source plus the dataset-only fingerprint and index metadata."""
+    ready: tuple
+    blocked: tuple
+    excluded_records: tuple
+    sources: tuple          # per source: export (as written in the manifest), export_sha256, versions
+    fingerprint: dict       # normalized manifest content; goes into the checkpoint fingerprint
+    asset_memory: dict | None = None
+
+    @property
+    def unversioned_producer_accepted(self):
+        return any(s['versions']['unversioned_producer_accepted'] for s in self.sources)
+
+
+def _case_key(failure_type, endpoints):
+    return (failure_type, tuple(sorted(endpoints)))
+
+
+def parse_mask_derivation(value):
+    """Validate one psdl2_mask_derivation_v1 object.
+
+    Returns the canonical (fingerprintable) object and a lookup from case key to the per-ROI record.
+    """
+    if not isinstance(value, dict) or set(value) != {'schema_version', 'rule_version', 'cases'}:
+        raise ContractError('mask_derivation_envelope_invalid')
+    if value['schema_version'] != DERIVATION_SCHEMA:
+        raise ContractError('unknown_mask_derivation_schema')
+    rule = text(value['rule_version'])
+    if not isinstance(value['cases'], list):
+        raise ContractError('mask_derivation_cases_list_required')
+    lookup, canonical = {}, []
+    for entry in value['cases']:
+        if not isinstance(entry, dict) or set(entry) != {'case', 'processed_endpoint', 'removed_layers'}:
+            raise ContractError('mask_derivation_entry_invalid')
+        case = entry['case']
+        if not isinstance(case, dict) or set(case) != {'failure_type', 'endpoints'}:
+            raise ContractError('mask_derivation_case_invalid')
+        if case['failure_type'] not in _FAILURE_TYPES:
+            raise ContractError('mask_derivation_failure_type_invalid')
+        if not isinstance(case['endpoints'], list) or len(case['endpoints']) != 2:
+            raise ContractError('mask_derivation_two_endpoints_required')
+        endpoints = [_endpoint(ep) for ep in case['endpoints']]
+        if len(set(endpoints)) != 2:
+            raise ContractError('mask_derivation_duplicate_endpoint')
+        removed = entry['removed_layers']
+        if not isinstance(removed, list):
+            raise ContractError('mask_derivation_removed_layers_list_required')
+        removed = [text(layer) for layer in removed]
+        if len(set(removed)) != len(removed):
+            raise ContractError('mask_derivation_removed_layers_duplicate')
+        if set(removed) & {ep[2] for ep in endpoints}:
+            raise ContractError('mask_derivation_removed_layer_is_endpoint_layer')
+        removed = sorted(removed)
+        processed = entry['processed_endpoint']
+        if case['failure_type'] == 'lateral_short':
+            # Lateral derivation is a known empty value, distinct from an absent derivation.
+            if processed is not None or removed:
+                raise ContractError('mask_derivation_lateral_must_be_empty')
+            processed_binding = None
+        else:
+            if not isinstance(processed, str):
+                raise ContractError('mask_derivation_processed_endpoint_required')
+            matches = [ep for ep in endpoints if ep[0] == processed]
+            if len(matches) != 1:
+                raise ContractError('mask_derivation_processed_endpoint_invalid')
+            processed_binding = {'role': matches[0][1], 'actual_layer': matches[0][2]}
+        key = _case_key(case['failure_type'], endpoints)
+        if key in lookup:
+            raise ContractError('mask_derivation_duplicate_case')
+        # Compared by (role, actual_layer), never by electrode id: names differ between products.
+        lookup[key] = {'schema_version': DERIVATION_SCHEMA, 'rule_version': rule,
+                       'processed_endpoint': processed_binding, 'removed_layers': removed}
+        canonical.append((key, {'case': {'failure_type': case['failure_type'],
+                                         'endpoints': [dict(electrode_id=e[0], role=e[1], actual_layer=e[2])
+                                                       for e in sorted(endpoints)]},
+                                'processed_endpoint': processed, 'removed_layers': removed}))
+    canonical.sort(key=lambda pair: pair[0])
+    return ({'schema_version': DERIVATION_SCHEMA, 'rule_version': rule, 'cases': [c for _, c in canonical]}, lookup)
+
+
+def _join(base, value):
+    return Path(text(value)) if Path(text(value)).is_absolute() else base / value
+
+
+PATCH_SET_SCHEMA = 'psdl2_patch_set_v1'
+PATCH_MODES = ('random', 'grid')
+
+
+def canonical_sha256(value):
+    return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(',', ':'), allow_nan=False).encode()).hexdigest()
+
+
+def views_fingerprint(config):
+    """Same value as ``checkpoint.fingerprint(asdict(view_config))`` (the index's view_fingerprint), without torch."""
+    from dataclasses import asdict, is_dataclass
+    if not is_dataclass(config) or isinstance(config, type):
+        raise ContractError('expected_views_must_be_view_config')
+    return canonical_sha256(asdict(config))
+
+
+def patch_roi_id(template_roi_id, center_xy_um, mode, generator_version):
+    center = [float(center_xy_um[0]), float(center_xy_um[1])]
+    return 'patch_' + canonical_sha256([template_roi_id, center, mode, generator_version])[:24]
+
+
+def patch_set_content_hash(document):
+    """Hash of the whole document without header.content_sha256."""
+    header = {k: v for k, v in document['header'].items() if k != 'content_sha256'}
+    return canonical_sha256({**document, 'header': header})
+
+
+def _read_patch_set(path):
+    raw = Path(path).read_bytes()
+    document = json.loads(raw.decode('utf-8'))
+    if not isinstance(document, dict) or set(document) != {'schema_version', 'header', 'patches'}:
+        raise ContractError('patch_set_envelope_invalid')
+    if document['schema_version'] != PATCH_SET_SCHEMA:
+        raise ContractError('unknown_patch_set_schema')
+    header = document['header']
+    if not isinstance(header, dict) or not isinstance(document['patches'], list):
+        raise ContractError('patch_set_envelope_invalid')
+    template = header.get('template_export')
+    if not isinstance(template, dict) or not {'path', 'sha256'} <= set(template):
+        raise ContractError('patch_set_envelope_invalid')
+    for key in ('generator_version', 'views_fingerprint', 'content_sha256'):
+        text(header.get(key))
+    return document, hashlib.sha256(raw).hexdigest()
+
+
+def _expand_patch_set(path_text, path, source, templates, expected_views_fp):
+    """Validate one patch set against its source and return (expanded ROIs, fingerprint entry).
+
+    ``templates`` maps roi_id to the source's ready ROI (mask_derivation already attached). Every
+    expanded ROI shares the template's decoded channel arrays; only centre, id and provenance differ.
+    """
+    if not Path(path).is_file():
+        raise ContractError('patch_set_missing: '+path_text)
+    document, set_sha = _read_patch_set(path)
+    header = document['header']
+    if header['template_export']['sha256'] != source['export_sha256']:
+        raise ContractError('stale_patch_set: '+path_text)
+    generator = header['generator_version']
+    expanded, ids = [], set()
+    for patch in document['patches']:
+        if not isinstance(patch, dict) or set(patch) != {'template_roi_id', 'center_xy_um', 'mode', 'roi_id'}:
+            raise ContractError('patch_record_invalid')
+        template = templates.get(patch['template_roi_id'])
+        if template is None:
+            raise ContractError('patch_template_not_ready: %s' % (patch['template_roi_id'],))
+        if template.row['source_kind'] != 'manual':
+            raise ContractError('patch_template_not_manual: %s' % (patch['template_roi_id'],))
+        if patch['mode'] not in PATCH_MODES:
+            raise ContractError('patch_mode_invalid')
+        try:
+            center = xy(patch['center_xy_um'])
+        except ContractError:
+            raise ContractError('patch_center_not_finite: %s' % (patch['roi_id'],)) from None
+        if patch_roi_id(patch['template_roi_id'], center, patch['mode'], generator) != patch['roi_id']:
+            raise ContractError('patch_id_mismatch: %s' % (patch['roi_id'],))
+        if patch['roi_id'] in ids:
+            raise ContractError('duplicate_roi_id_across_sources: '+patch['roi_id'])
+        ids.add(patch['roi_id'])
+        # Same position/valid checks as a ready template row, now at the patch centre.
+        cx, cy = template.frame.um_to_pixel(center)
+        if not (0 <= cx < template.frame.shape_yx[1] and 0 <= cy < template.frame.shape_yx[0]):
+            raise ContractError('patch_position_outside_source_frame: '+patch['roi_id'])
+        if not template.channels['valid'][int(cy), int(cx)]:
+            raise ContractError('patch_position_outside_valid_domain: '+patch['roi_id'])
+        meta = {'set_sha256': set_sha, 'template_roi_id': patch['template_roi_id'], 'mode': patch['mode'],
+                'generator_version': generator}
+        row = deepcopy(template.row)
+        row['roi_id'], row['center_xy_um'] = patch['roi_id'], list(center)
+        provenance = dict(row['provenance']) if isinstance(row.get('provenance'), dict) else {}
+        provenance['patch'] = meta
+        row['provenance'] = provenance
+        expanded.append(replace(template, row=row, channels=dict(template.channels),
+                                channel_bindings=deepcopy(template.channel_bindings),
+                                versions=deepcopy(template.versions), mask_derivation=deepcopy(template.mask_derivation),
+                                patch=deepcopy(meta)))
+    if patch_set_content_hash(document) != header['content_sha256']:
+        raise ContractError('patch_set_hash_mismatch: '+path_text)
+    if header['views_fingerprint'] != expected_views_fp:
+        raise ContractError('patch_set_view_config_mismatch: '+path_text)
+    return expanded, {'path': path_text, 'sha256': set_sha}
+
+
+def load_dataset(path, *, expected_views=None, expected_producer_commit=None, allow_unversioned_producer=False,
+                 max_asset_memory_mb=None):
+    """Load a psdl2_dataset_v1 manifest: several exports, one asset cache, one global memory limit.
+
+    Relative paths resolve from the manifest's folder. Each source goes through ``load_export``
+    unchanged. A source with ``patch_sets`` admits only its expanded patch rows (never the template rows);
+    ``expected_views`` (a ViewConfig) is then required and must match each patch set's views fingerprint.
+    """
+    path = Path(path)
+    base = path.parent
+    manifest = json.loads(path.read_text(encoding='utf-8'))
+    if not isinstance(manifest, dict) or manifest.get('schema_version') != DATASET_SCHEMA:
+        raise ContractError('unknown_dataset_schema')
+    if set(manifest) != {'schema_version', 'sources'}:
+        raise ContractError('unsupported_dataset_field')
+    sources = manifest['sources']
+    if not isinstance(sources, list) or not sources:
+        raise ContractError('dataset_sources_required')
+    cache = AssetCache(_memory_limit(max_asset_memory_mb))
+    plan = []
+    for source in sources:
+        if not isinstance(source, dict) or not {'export', 'export_sha256'} <= set(source) \
+                or set(source) - {'export', 'export_sha256', 'assets_root', 'patch_sets', 'mask_derivation'}:
+            raise ContractError('unsupported_dataset_source_field')
+        patch_sets = source.get('patch_sets', [])
+        if not isinstance(patch_sets, list):
+            raise ContractError('patch_sets_list_required')
+        if any(not isinstance(p, str) for p in patch_sets):
+            raise ContractError('patch_sets_list_required')
+        if patch_sets and expected_views is None:
+            raise ContractError('patch_set_views_unchecked')
+        derivation = None
+        if source.get('mask_derivation') is not None:
+            raw = source['mask_derivation']
+            if isinstance(raw, str):
+                raw = json.loads(_join(base, raw).read_text(encoding='utf-8'))
+            derivation = parse_mask_derivation(raw)
+        plan.append((source, derivation))
+    expected_fp = views_fingerprint(expected_views) if any(source.get('patch_sets') for source, _ in plan) else None
+    ready, blocked, excluded, infos, content, seen, used_sets = [], [], [], [], [], set(), set()
+    for source, derivation in plan:
+        export_path = _join(base, source['export'])
+        if hashlib.sha256(export_path.read_bytes()).hexdigest() != _hash(source['export_sha256']):
+            raise ContractError('export_sha256_mismatch')
+        loaded = load_export(export_path, assets_root=None if source.get('assets_root') is None else _join(base, source['assets_root']),
+                             expected_producer_commit=expected_producer_commit,
+                             allow_unversioned_producer=allow_unversioned_producer, cache=cache)
+        patch_sets = source.get('patch_sets') or []
+        # Template ids of a patched source stay reserved even though its patches replace the rows.
+        for rid in [r.row['roi_id'] for r in loaded.ready]:
+            if rid in seen:
+                raise ContractError('duplicate_roi_id_across_sources: '+rid)
+            seen.add(rid)
+        for rid in [r['roi_id'] for r in loaded.blocked]:
+            if rid in seen:
+                raise ContractError('duplicate_roi_id_across_sources: '+rid)
+            seen.add(rid)
+        rois = loaded.ready
+        if derivation is not None:
+            lookup, used = derivation[1], set()
+            attached = []
+            for roi in rois:
+                key = _case_key(roi.row['failure_type'], [_endpoint(ep) for ep in roi.row['endpoints']])
+                if key not in lookup:
+                    raise ContractError('mask_derivation_case_missing: '+roi.row['roi_id'])
+                used.add(key)
+                attached.append(replace(roi, mask_derivation=deepcopy(lookup[key])))
+            # A row DL2 blocked still references its producer case; ready rows must all match.
+            for row in loaded.blocked:
+                try:
+                    key = _case_key(row['failure_type'], [_endpoint(ep) for ep in row['endpoints']])
+                except (ContractError, KeyError, TypeError, ValueError):
+                    continue
+                if key in lookup:
+                    used.add(key)
+            unreferenced = sorted(set(lookup) - used)
+            if unreferenced:
+                failure_type, eps = unreferenced[0]
+                raise ContractError('mask_derivation_case_unreferenced: %s %s' % (failure_type, list(eps)))
+            rois = tuple(attached)
+        patch_entries = []
+        if patch_sets:
+            templates = {roi.row['roi_id']: roi for roi in rois}
+            expanded = []
+            for path_text in patch_sets:
+                set_path = _join(base, path_text)
+                rows, entry = _expand_patch_set(path_text, set_path, source, templates, expected_fp)
+                if entry['sha256'] in used_sets:
+                    raise ContractError('duplicate_patch_set: '+path_text)
+                used_sets.add(entry['sha256'])
+                for roi in rows:
+                    if roi.row['roi_id'] in seen:
+                        raise ContractError('duplicate_roi_id_across_sources: '+roi.row['roi_id'])
+                    seen.add(roi.row['roi_id'])
+                expanded.extend(rows); patch_entries.append(entry)
+            rois = tuple(expanded)
+        ready.extend(rois); blocked.extend(loaded.blocked); excluded.extend(loaded.excluded_records)
+        infos.append({'export': source['export'], 'export_sha256': source['export_sha256'], 'versions': loaded.versions,
+                      **({'patch_sets': patch_entries} if patch_entries else {})})
+        content.append({'export': source['export'], 'export_sha256': source['export_sha256'], 'patch_sets': patch_entries,
+                        'mask_derivation': None if derivation is None else derivation[0]})
+    return Dataset(tuple(ready), tuple(blocked), tuple(excluded), tuple(infos),
+                   {'schema_version': DATASET_SCHEMA, 'sources': content}, cache.report())
 
 
 def main(argv=None):

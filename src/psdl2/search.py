@@ -27,6 +27,28 @@ def cosine(first, second):
     return round(float(np.clip(value, -1, 1)), 6)
 
 
+def validate_mask_derivation(value, signature=None):
+    from .data import DERIVATION_SCHEMA
+    if (not isinstance(value, dict) or set(value) != {'schema_version', 'rule_version', 'processed_endpoint', 'removed_layers'}
+            or value['schema_version'] != DERIVATION_SCHEMA):
+        raise ContractError('invalid_record_mask_derivation')
+    text(value['rule_version'])
+    processed = value['processed_endpoint']
+    if processed is not None:
+        if not isinstance(processed, dict) or set(processed) != {'role', 'actual_layer'}:
+            raise ContractError('invalid_record_mask_derivation')
+        text(processed['role']); text(processed['actual_layer'])
+    if signature is not None:
+        # processed_endpoint is null exactly for lateral cases, else one of the signature endpoints.
+        if (processed is None) != (signature['failure_type'] == 'lateral_short'):
+            raise ContractError('invalid_record_mask_derivation')
+        if processed is not None and sum(1 for ep in signature['endpoints'] if (ep['role'], ep['actual_layer']) == (processed['role'], processed['actual_layer'])) != 1:
+            raise ContractError('invalid_record_mask_derivation')
+    layers = value['removed_layers']
+    if not isinstance(layers, list) or layers != sorted(set(text(layer) for layer in layers)):
+        raise ContractError('invalid_record_mask_derivation')
+
+
 def validate_record(record):
     for key in ('roi_id', 'product_id', 'case_id', 'source_version'):
         text(record[key])
@@ -49,13 +71,17 @@ def validate_record(record):
             record.get('comparison_basis') != COMPARISON_BASIS):
         raise ContractError('incompatible_candidate_view_policy')
     signature = record['case_signature']
-    if set(signature) != {'failure_type', 'analysis_layer', 'endpoints', 'connection_observation', 'cnt_binding', 'via_count'}:
+    base_keys = {'failure_type', 'analysis_layer', 'endpoints', 'connection_observation', 'cnt_binding', 'via_count'}
+    # 'mask_derivation' is optional: absent means unknown (single-export records carry none).
+    if not base_keys <= set(signature) <= base_keys | {'mask_derivation'}:
         raise ContractError('complete_case_signature_required')
     endpoint_key = lambda ep: (ep['electrode_id'], ep['role'], ep['actual_layer'])
     if sorted(map(endpoint_key, signature['endpoints'])) != sorted(map(endpoint_key, signature['cnt_binding'])):
         raise ContractError('CNT_endpoint_binding_mismatch')
     if len(signature['endpoints']) != 2:
         raise ContractError('two_candidate_endpoints_required')
+    if 'mask_derivation' in signature:
+        validate_mask_derivation(signature['mask_derivation'], signature)
     _embedding(record['embedding'])
 
 
@@ -93,7 +119,7 @@ def endpoint_key_for_identity(ep):
     return (ep['electrode_id'], ep['role'], ep['actual_layer'])
 
 
-def search(query, index, cohort, *, topk, expand=False):
+def search(query, index, cohort, *, topk, expand=False, ignore_mask_derivation=False):
     validate_record(query); validate_index(index)
     if not isinstance(cohort, (set, list, tuple)) or not cohort:
         raise ContractError('explicit_DL1_product_cohort_required')
@@ -101,6 +127,7 @@ def search(query, index, cohort, *, topk, expand=False):
     if type(topk) is not int or topk < 1:
         raise ContractError('positive_topk_required')
     primary, supplementary, rejected = [], [], []
+    derivation_rejected = set()
     from .index import compatibility_signature
     for candidate in index['records']:
         in_primary = candidate['product_id'] in cohort
@@ -110,6 +137,13 @@ def search(query, index, cohort, *, topk, expand=False):
             rejected.append({'roi_id': candidate['roi_id'], 'reason': 'query_itself_excluded'}); continue
         if compatibility_signature(candidate['case_signature']) != compatibility_signature(query['case_signature']):
             rejected.append({'roi_id': candidate['roi_id'], 'reason': 'case_or_CNT_binding_incompatible'}); continue
+        if not ignore_mask_derivation:
+            wanted, offered = query['case_signature'].get('mask_derivation'), candidate['case_signature'].get('mask_derivation')
+            if wanted is not None or offered is not None:
+                if wanted is None or offered is None:
+                    rejected.append({'roi_id': candidate['roi_id'], 'reason': 'mask_derivation_unknown'}); derivation_rejected.add(candidate['roi_id']); continue
+                if wanted != offered:
+                    rejected.append({'roi_id': candidate['roi_id'], 'reason': 'mask_derivation_mismatch'}); derivation_rejected.add(candidate['roi_id']); continue
         same_location = (candidate['source_identity'] == query['source_identity']
                          and candidate['frame'] == query['frame']
                          and candidate['center_xy_um'] == query['center_xy_um']
@@ -131,17 +165,26 @@ def search(query, index, cohort, *, topk, expand=False):
         cohort_records = [r for r in index['records'] if r['product_id'] in cohort]
         status = 'unavailable'
         reasons = ['no_candidates_in_primary_cohort' if not cohort_records else 'no_case_compatible_primary_candidates']
-    return {'query': {key: deepcopy(value) for key, value in query.items() if key != 'embedding'},
+        others = {r['roi_id'] for r in cohort_records if not (r['roi_id'] == query['roi_id'] and r['source_identity'] == query['source_identity'])}
+        if others and others <= derivation_rejected:
+            reasons = ['no_mask_derivation_compatible_candidates']
+    result = {'query': {key: deepcopy(value) for key, value in query.items() if key != 'embedding'},
             'status': status, 'no_match_reasons': reasons, 'primary': primary[:topk],
             'supplementary': supplementary[:topk] if expand else [], 'rejected': rejected,
             'primary_cohort': sorted(cohort), 'expanded': bool(expand),
             'index_roi_ids': [r['roi_id'] for r in index['records']],
             'interpretation': 'similarity_only_not_registration_cause_or_risk'}
+    if ignore_mask_derivation:
+        result['mask_derivation_comparison'] = 'ignored'
+    return result
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description='Search one original ROI within an explicit DL1 cohort offline.')
-    parser.add_argument('export', type=Path); parser.add_argument('--assets-root', type=Path)
+    parser.add_argument('export', type=Path, nargs='?'); parser.add_argument('--assets-root', type=Path)
+    parser.add_argument('--query-dataset', type=Path, help='psdl2_dataset_v1 manifest wrapping the query export (and its mask_derivation)')
+    parser.add_argument('--ignore-mask-derivation', action='store_true',
+                        help='skip the mask_derivation compatibility check; the result records that it was skipped')
     parser.add_argument('--roi-id', required=True); parser.add_argument('--checkpoint', required=True, type=Path)
     parser.add_argument('--index', required=True, type=Path); parser.add_argument('--cohort', required=True, type=Path)
     parser.add_argument('--topk', required=True, type=int); parser.add_argument('--expand', action='store_true')
@@ -155,22 +198,34 @@ def main(argv=None):
         from .checkpoint import fingerprint
         from .model import resolve_device
         resolve_device(args.device)  # fail before the slow export load
-        from .data import load_export
+        from .data import load_dataset, load_export
         from .index import candidate_record, load_encoder, view_config_dict
-        imported = load_export(args.export, assets_root=args.assets_root,
-                             allow_unversioned_producer=args.allow_unversioned_producer,
-                             max_asset_memory_mb=args.max_asset_memory_mb)
+        if (args.export is None) == (args.query_dataset is None):
+            raise ContractError('exactly_one_of_export_or_query_dataset_required')
+        if args.query_dataset is not None:
+            if args.assets_root is not None:
+                raise ContractError('assets_root_not_allowed_with_dataset')
+            model, views, fp = load_encoder(args.checkpoint, args.device)
+            imported = load_dataset(args.query_dataset, expected_views=views,
+                                    allow_unversioned_producer=args.allow_unversioned_producer,
+                                    max_asset_memory_mb=args.max_asset_memory_mb)
+        else:
+            imported = load_export(args.export, assets_root=args.assets_root,
+                                   allow_unversioned_producer=args.allow_unversioned_producer,
+                                   max_asset_memory_mb=args.max_asset_memory_mb)
         rois = [r for r in imported.ready if r.row['roi_id'] == args.roi_id]
         if len(rois) != 1:
             raise ContractError('one_ready_query_roi_required')
-        model, views, fp = load_encoder(args.checkpoint, args.device)
+        if args.query_dataset is None:
+            model, views, fp = load_encoder(args.checkpoint, args.device)
         index = json.loads(args.index.read_text())
         if index['checkpoint_fingerprint'] != fp or index['view_fingerprint'] != fingerprint(view_config_dict(views)):
             raise ContractError('incompatible_index_checkpoint_or_transform')
         bundle = views.bundle(rois[0])
         with torch.no_grad():
-            query = candidate_record(bundle, model([bundle])['embedding'][0].cpu().tolist())
-        result = search(query, index, read_cohort(args.cohort), topk=args.topk, expand=args.expand)
+            query = candidate_record(bundle, model([bundle])['embedding'][0].cpu().tolist(), rois[0].mask_derivation)
+        result = search(query, index, read_cohort(args.cohort), topk=args.topk, expand=args.expand,
+                        ignore_mask_derivation=args.ignore_mask_derivation)
         args.out.parent.mkdir(parents=True, exist_ok=True); args.out.write_text(json.dumps(result, allow_nan=False, indent=2))
         print(json.dumps({'status': result['status'], 'primary': len(result['primary']), 'supplementary': len(result['supplementary']),
                           'no_match_reasons': result['no_match_reasons']}))

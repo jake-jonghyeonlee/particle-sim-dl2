@@ -291,3 +291,62 @@ coverage must be reviewed alongside the metric. Search records index ROI IDs;
 older result files need `--index` to supply that set. Optional labels can include
 known-different retrievals as counterexamples. Metrics describe only the supplied
 labels; real performance remains pending.
+
+## Patch generator conditions versus the unchanged preflight
+
+`python -m psdl2.patches` chooses training/index positions by shape. Its location conditions are **generator-only**;
+`views.preflight` (`src/psdl2/views.py:103-130`, called from `src/psdl2/train.py:89-90`) is unchanged and stays what it was.
+
+| | Generator (`src/psdl2/patches.py:76-110`) | Preflight (`views.py:103-130`) |
+|---|---|---|
+| Whole window inside the frame | required: centre +/- (wide/2 + jitter) within the frame, equality with the edge allowed | **not checked**; cells outside the frame are contract padding (`data_contract.md`) |
+| Core fully valid | required | not checked here (core cell representation only) |
+| Layout anchor in core | required: a marked cell of either endpoint layout in the core | **not checked**; the anchor is tested when a view is built (`views.py:234-237`, `no_core_layout_anchor`) |
+| Both endpoints in the near window (Q1) | required: each endpoint layout has a marked cell in the unjittered near window | not checked |
+| Core cells representable at jitter extrema | by running `preflight` as the last condition | yes (`view_preflight_core_not_represented_at_jitter_extrema`, pitch rules) |
+
+The generator conditions do not guarantee that every jitter pair passes topology; training keeps its bounded retries and rejection counters.
+Existing single-export ROIs whose windows leave the frame still train as before (`tests/test_patches.py::test_legacy_single_export_training_with_a_window_outside_the_frame_is_unchanged`).
+The grid/random candidate sets are exact (rational arithmetic on the stored floats), and a funnel per case is printed on shortage
+(`candidates, rejected_repeat_period, rejected_window, rejected_valid, rejected_anchor, rejected_q1, rejected_preflight, rejected_spacing, output`).
+`--repeat-period-um` and `--min-spacing-um` apply only to random patches; grid takes every admissible point and its step should be
+at most the hit tolerance of the evaluation (`--coverage-labels` reports the actual nearest-grid distance per label).
+A patch set records the views fingerprint it was generated for; `train`, `index`, `search` and `make_split` refuse it when their views differ
+(`patch_set_view_config_mismatch`, `src/psdl2/data.py:497-498`).
+
+## Dataset training and `make_split`
+
+`train --dataset M`, `index --dataset M` and `search --query-dataset M` read a `psdl2_dataset_v1` manifest (`data_contract.md`).
+Exactly one of the export argument and `--dataset` is accepted (`exactly_one_of_export_or_dataset_required`,
+`src/psdl2/train.py:186`, `src/psdl2/index.py:114`, `exactly_one_of_export_or_query_dataset_required`, `src/psdl2/search.py:204`);
+`--assets-root` is rejected with a dataset. In dataset mode only, the checkpoint fingerprint contains `dataset` (normalised manifest, export
+hashes, patch-set file hashes, `mask_derivation`); a changed dataset rejects `--resume` (`incompatible_config_fingerprint`) and leaves the old
+checkpoint untouched. Single-export runs produce byte-identical outputs to the baseline commit (`tests/test_dataset_cli.py`).
+An index built from a dataset has `sources[]` (export path, sha256, versions, patch sets) instead of `producer_versions`, and each record
+may carry `provenance.patch`.
+
+`python -m psdl2.make_split --dataset M --config C --lineages L --assign A --out S [--overwrite]` (`src/psdl2/make_split.py:41`) maps
+every ready `roi_id` through product -> lineage (`L`) -> split (`A`: lineage -> `train|validation|test`) and validates the result with
+`validate_split` (so leakage is an error). Errors (exit 2, no output): `product_without_lineage: <product>`, `invalid_lineage_id: <product>`,
+`lineage_unassigned: <lineage>`, `invalid_split_name: <lineage>`, `lineages_and_assign_objects_required`, `no_ready_rois_to_split`,
+`output_exists_use_overwrite`, patch-set/dataset errors from `load_dataset`. The file is published atomically. All patches of one product share its
+lineage, so they land in one split. `split.groups` was rewritten (hash unions for lineage/augmentation, per-frame sweep for overlap,
+`src/psdl2/split.py:53`) with unchanged semantics, checked against a verbatim copy of the old implementation in `tests/test_split_groups_diff.py`;
+20,000 patches take well under a second.
+
+## `mask_derivation` search compatibility
+
+The derivation of a query is not guessed from candidates: it comes from the query dataset manifest. `search` compares it with each candidate's
+(`src/psdl2/search.py:140-146`) after the unchanged case-signature check:
+
+| query | candidate | result |
+|---|---|---|
+| none | none | unchanged behaviour (single-export indexes) |
+| present | present, equal (rule_version, processed endpoint `(role, actual_layer)`, removed layers) | compatible |
+| present | present, different in any of those | rejected `mask_derivation_mismatch` |
+| present or none | none or present (only one side has it) | rejected `mask_derivation_unknown` |
+| any | any, with `--ignore-mask-derivation` | not compared; the result gets `"mask_derivation_comparison": "ignored"` |
+
+Rejections appear in `rejected` of the result. If every other cohort candidate is excluded this way, `no_match_reasons` is
+`no_mask_derivation_compatible_candidates` and the exit code is 3. `--ignore-mask-derivation` exists only on `search`; it is for
+diagnosis (for example to see what would match across derivations), not a default.
