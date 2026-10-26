@@ -40,6 +40,7 @@ BASE_DIR = None                               # JOBS·LOG_FILE·WORK_DIR의 상�
 import base64
 import hashlib
 import importlib
+import importlib.util
 import json
 import os
 import sys
@@ -50,6 +51,15 @@ import zlib
 from pathlib import Path
 
 CONTINUE_CODES = (0, 3)
+DONE_SUFFIX = ".psdl2_done.json"
+# 작업(모듈)별 바깥 의존. 표에 없는 모듈은 numpy·Pillow 만 쓴다(patches, data 포함).
+# 이 표는 src/psdl2 의 실제 import 를 확인해 만든다: train·index·make_split·evaluate 는 import 때, search 는 실행 때 torch 를 쓴다.
+MODULE_NEEDS = {
+    "baseline_ncc": (), "eval_position": (), "patches": (), "data": (),
+    "train": ("torch",), "index": ("torch",), "search": ("torch",), "evaluate": ("torch",), "make_split": ("torch",),
+}
+# 작업별 산출물 옵션. 표에 없으면 --out 하나다. 폴더 값이면 그 안의 모든 파일이 산출물이다.
+OUTPUT_OPTIONS = {"baseline_ncc": ("--out", "--sheet-dir")}
 PAYLOAD_SHA256 = "@@SHA@@"
 PAYLOAD = (
 @@PAYLOAD@@
@@ -87,21 +97,164 @@ def _extract():
     raise RuntimeError("cannot extract the psdl2 package anywhere: " + "; ".join(errors))
 
 
+def _console_write(stream, text):
+    """콘솔은 인코딩 오류를 '?'로 바꿔 흡수한다. 콘솔 때문에 작업이 죽지 않는다."""
+    try:
+        stream.write(text)
+    except UnicodeEncodeError:
+        encoding = getattr(stream, "encoding", None) or "ascii"
+        stream.write(text.encode(encoding, "replace").decode(encoding, "replace"))
+
+
 class _Tee:
-    def __init__(self, *streams):
-        self.streams = streams
+    """로그 파일(UTF-8)에 먼저 쓰고 콘솔에 쓴다."""
+
+    def __init__(self, log, console):
+        self.log = log
+        self.console = console
 
     def write(self, text):
-        for stream in self.streams:
-            stream.write(text)
+        self.log.write(text)
+        _console_write(self.console, text)
         return len(text)
 
     def flush(self):
-        for stream in self.streams:
-            stream.flush()
+        self.log.flush()
+        self.console.flush()
 
     def isatty(self):
         return False
+
+
+def _fail(code, english, korean, early=False):
+    """오류 코드와 조치 문구를 stderr(와 로그)에 한 줄로 쓰고 종료 코드 2로 멈춘다. traceback 은 없다.
+    ASCII 콘솔은 한글을 못 보여 주므로 영어 문구를 앞에 둔다. early=True 는 로그 파일을 열기 전 단계다."""
+    line = f"[psdl2_job] ERROR {code}: {english} | {korean}\\n"
+    if early:
+        _console_write(sys.__stderr__, line)
+    else:
+        sys.stderr.write(line)
+        sys.stderr.flush()
+    raise SystemExit(2)
+
+
+def _sha256_file(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for block in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _rel(path):
+    """현재 작업 폴더(BASE_DIR) 아래면 상대 경로(/ 구분), 아니면 절대 경로."""
+    resolved = Path(path).resolve()
+    try:
+        return resolved.relative_to(Path.cwd().resolve()).as_posix()
+    except ValueError:
+        return str(resolved)
+
+
+def _option_values(argv, options):
+    """argv 에서 `--옵션 값`·`--옵션=값` 의 값을 모은다(옵션당 값 하나)."""
+    values = []
+    index = 0
+    while index < len(argv):
+        key, equals, value = argv[index].partition("=")
+        if key in options:
+            if equals:
+                values.append(value)
+            elif index + 1 < len(argv) and not argv[index + 1].startswith("--"):
+                values.append(argv[index + 1])
+                index += 1
+        index += 1
+    return values
+
+
+def _marker_path(name, argv):
+    out = _option_values(argv, ("--out",))
+    return Path(out[0] + DONE_SUFFIX) if out else None
+
+
+def _output_files(name, argv):
+    """작업이 만든(만들) 산출물 파일 목록. 폴더 값이면 안의 모든 파일."""
+    files = []
+    for value in _option_values(argv, OUTPUT_OPTIONS.get(name, ("--out",))):
+        path = Path(value)
+        if path.is_dir():
+            files += [p for p in path.rglob("*") if p.is_file()]
+        elif path.is_file():
+            files.append(path)
+    return sorted(files, key=lambda p: _rel(p))
+
+
+def _input_hashes(name, argv):
+    """argv 에 적힌 기존 파일 중 산출물이 아닌 것(입력)의 sha256. 키는 적힌 그대로의 경로."""
+    outputs = set(_option_values(argv, OUTPUT_OPTIONS.get(name, ("--out",))))
+    hashes = {}
+    for token in argv:
+        for candidate in (token, token.partition("=")[2]):
+            if candidate and candidate not in outputs and Path(candidate).is_file():
+                hashes[candidate] = _sha256_file(candidate)
+    return hashes
+
+
+def _marker_state(marker, name, argv):
+    """None 이면 표지와 현재 상태가 모두 같다(건너뛴다). 아니면 (사유, 한글 설명, 영어 설명)."""
+    try:
+        done = json.loads(marker.read_text(encoding="utf-8"))
+        if not isinstance(done, dict):
+            raise ValueError("not an object")
+    except (OSError, ValueError) as exc:
+        return "marker_unreadable", f"표지를 읽을 수 없다 ({type(exc).__name__})", "the marker cannot be read"
+    if done.get("runner_payload_sha256") != PAYLOAD_SHA256:
+        return "runner_changed", "표지를 만든 때와 이 실행기의 psdl2 판이 다르다", "this runner bundles a different psdl2 build than the one that wrote the marker"
+    if done.get("module") != name or done.get("argv") != argv:
+        return "inputs_changed", "표지를 만든 때와 작업 모듈 또는 인자가 다르다", "the job module or its arguments differ from the marker"
+    recorded, current = done.get("input_sha256s", {}), _input_hashes(name, argv)
+    if recorded != current:
+        changed = sorted(k for k in set(recorded) | set(current) if recorded.get(k) != current.get(k))
+        return "inputs_changed", "입력 파일이 표지를 만든 때와 다르다: " + ", ".join(changed), "input files differ from the marker: " + ", ".join(changed)
+    for entry in done.get("outputs", []):
+        path = Path(entry["path"])
+        if not path.is_file():
+            return "output_missing", f"산출물이 없다: {entry['path']}", f"output file is missing: {entry['path']}"
+        if _sha256_file(path) != entry["sha256"]:
+            return "output_modified", f"산출물이 표지 기록과 다르다: {entry['path']}", f"output file differs from the marker: {entry['path']}"
+    return None
+
+
+def _write_marker(marker, name, argv, inputs):
+    outputs = _output_files(name, argv)
+    if not any(Path(v).is_file() or Path(v).is_dir() for v in _option_values(argv, ("--out",))):
+        _fail("job_output_missing", f"{name} exited 0 but its --out output is missing; no done marker is written",
+              f"{name} 이 종료 코드 0 인데 --out 산출물이 없다. 완료 표지를 쓰지 않는다.")
+    done = {"module": name, "runner_payload_sha256": PAYLOAD_SHA256, "argv": argv, "input_sha256s": inputs,
+            "outputs": [{"path": _rel(p), "sha256": _sha256_file(p)} for p in outputs]}
+    temp = marker.with_name(marker.name + f".tmp{os.getpid()}")
+    temp.write_text(json.dumps(done, indent=2, sort_keys=True) + "\\n", encoding="utf-8")
+    os.replace(str(temp), str(marker))
+
+
+def _check_requirements(name):
+    """작업 실행 전에 바깥 의존(torch)이 있는지 본다. 없으면 오류 코드로 멈춘다."""
+    for dependency in MODULE_NEEDS.get(name, ()):
+        if importlib.util.find_spec(dependency) is None:
+            _fail(f"{dependency}_required_for_{name}",
+                  f"job {name} needs {dependency}, which this Python ({sys.version.split()[0]}) does not have."
+                  f" Run this file with a Python that has {dependency}, or remove the {name} job from JOBS."
+                  " Outputs of earlier jobs are kept",
+                  f"{name} 작업에는 {dependency} 가 필요한데 이 Python({sys.version.split()[0]})에 없다."
+                  f" {dependency} 가 설치된 Python 으로 이 파일을 실행하거나, JOBS 에서 {name} 작업을 뺀다."
+                  " 앞 작업의 산출물은 그대로 남아 있다.")
+        try:
+            importlib.import_module(dependency)
+        except Exception as exc:
+            _fail(f"{dependency}_import_failed",
+                  f"importing {dependency} for job {name} failed ({type(exc).__name__}: {exc})."
+                  f" Check the {dependency} installation (CUDA and shared libraries). Outputs of earlier jobs are kept",
+                  f"{name} 작업을 위한 {dependency} import 가 실패했다."
+                  f" {dependency} 설치(CUDA·라이브러리 포함)를 확인한다. 앞 작업의 산출물은 그대로 남아 있다.")
 
 
 def run_jobs(jobs):
@@ -121,6 +274,19 @@ def run_jobs(jobs):
     print(f"[psdl2_job] {stamp()} {' | '.join(versions)} | psdl2 from {psdl2.__file__}", file=sys.stderr, flush=True)
     for name, args in jobs:
         argv = [str(a) for a in args]
+        marker = _marker_path(name, argv)
+        if marker is not None and marker.exists():
+            stale = _marker_state(marker, name, argv)
+            if stale is None:
+                print(f"[psdl2_job] {stamp()} skip completed {name} (done marker {_rel(marker)})", file=sys.stderr, flush=True)
+                continue
+            _fail(f"stale_done_marker:{stale[0]}",
+                  f"done marker {_rel(marker)} does not match job {name} ({stale[2]})."
+                  " Delete the marker and run again (if the job needs an empty output folder, move the old outputs away too)",
+                  f"{stale[1]}. 완료 표지 {_rel(marker)} 가 이 작업과 맞지 않는다."
+                  " 표지를 지우고 다시 실행한다(산출물 폴더가 비어 있어야 하는 작업이면 옛 산출물도 옮긴다).")
+        _check_requirements(name)
+        inputs = _input_hashes(name, argv) if marker is not None else None
         print(f"[psdl2_job] {stamp()} start {name} {' '.join(argv)}", file=sys.stderr, flush=True)
         started = time.time()
         main = importlib.import_module(f"psdl2.{name}").main
@@ -133,6 +299,9 @@ def run_jobs(jobs):
         print(f"[psdl2_job] {stamp()} {name} exit {code} in {time.time() - started:.0f}s", file=sys.stderr, flush=True)
         if code not in CONTINUE_CODES:
             raise SystemExit(code)
+        if code == 0 and marker is not None:
+            _write_marker(marker, name, argv, inputs)
+            print(f"[psdl2_job] {stamp()} wrote done marker {_rel(marker)}", file=sys.stderr, flush=True)
 
 
 def _base_dir():
@@ -148,12 +317,21 @@ def _base_dir():
 def _main():
     base, source = _base_dir()
     launched_cwd = os.getcwd()
+    if not base.is_dir():
+        _fail("base_dir_missing", f"the folder {base} ({source}) does not exist."
+                                  " Set BASE_DIR to the absolute path of an existing folder",
+              f"{source} 가 가리키는 폴더 {base} 가 없다. BASE_DIR 를 존재하는 폴더의 절대 경로로 고친다.", early=True)
     os.chdir(base)
     log = None
     if LOG_FILE:
-        Path(LOG_FILE).parent.mkdir(parents=True, exist_ok=True)
-        log = open(LOG_FILE, "a", buffering=1, encoding="utf-8")
-        sys.stdout, sys.stderr = _Tee(sys.__stdout__, log), _Tee(sys.__stderr__, log)
+        try:
+            Path(LOG_FILE).parent.mkdir(parents=True, exist_ok=True)
+            log = open(LOG_FILE, "a", buffering=1, encoding="utf-8")
+        except OSError as exc:
+            _fail("log_file_unwritable", f"cannot write LOG_FILE {LOG_FILE!r} under {base} ({type(exc).__name__}: {exc})."
+                                         " Set LOG_FILE to a writable path, or to None",
+                  f"LOG_FILE {LOG_FILE!r} 를 {base} 아래에 쓸 수 없다. LOG_FILE 을 쓸 수 있는 경로로 고치거나 None 으로 둔다.", early=True)
+        sys.stdout, sys.stderr = _Tee(log, sys.__stdout__), _Tee(log, sys.__stderr__)
     print(f"[psdl2_job] relative paths resolve from {base} ({source}); launched in {launched_cwd};"
           f" runner {globals().get('__file__')}", file=sys.stderr, flush=True)
     try:

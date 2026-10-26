@@ -180,6 +180,49 @@ PY=.venv-gpu/Scripts/python.exe
 - `--window-um`, `--topk`, `--max-memory-mb`(20, 4, 8000)는 예시 값이다. `--sheet-dir`는 없거나 빈 폴더여야 한다.
 - 다음 단계: 시트를 보고 `decisions.csv`를 쓴 뒤 simcompare 5회차(`confirm-pairs`)로 간다(simcompare `docs/usage.md` ETX 절).
 
+#### 실행기 오류 코드
+
+실행기가 스스로 멈출 때는 로그와 콘솔에 `[psdl2_job] ERROR <코드>: <영어 문구> | <한글 문구>` 한 줄을 남기고 종료 코드 2로 끝난다. traceback은 없다. 콘솔이 ASCII뿐이어도 영어 문구는 읽힌다. 로그 파일은 항상 UTF-8이고 로그를 먼저 쓴다.
+
+| 코드 | 원인 | 조치 |
+|---|---|---|
+| `base_dir_missing` | `BASE_DIR`가 가리키는 폴더가 없다 | 존재하는 폴더의 절대 경로로 고친다. 이 오류는 로그 파일을 열기 전이라 콘솔에만 나온다 |
+| `log_file_unwritable` | `LOG_FILE`을 `BASE_DIR` 아래에 쓸 수 없다(폴더 자리에 파일이 있거나 권한이 없음) | 쓸 수 있는 경로로 고치거나 `None`으로 둔다 |
+| `torch_required_for_<모듈>` | 그 작업(`train`, `index`, `search`, `evaluate`, `make_split`)에 torch가 필요한데 이 Python에 없다 | torch가 있는 Python으로 실행하거나 `JOBS`에서 그 작업을 뺀다. 앞 작업의 산출물은 남아 있다 |
+| `torch_import_failed` | torch 파일은 있으나 import가 실패한다(설치 손상, CUDA 라이브러리 등) | 메시지의 원인을 보고 torch 설치를 고친다. 앞 작업의 산출물은 남아 있다 |
+| `stale_done_marker:output_missing` | 완료 표지에 적힌 산출물이 지금 없다 | 표지(`<out>.psdl2_done.json`)를 지우고 다시 실행한다 |
+| `stale_done_marker:output_modified` | 산출물 내용이 표지에 적힌 sha256과 다르다 | 같음. 산출물을 일부러 고친 것이면 다른 이름으로 보관한다 |
+| `stale_done_marker:inputs_changed` | 입력 파일 내용 또는 작업 인자가 표지 때와 다르다 | 같음 |
+| `stale_done_marker:runner_changed` | 이 실행기의 `psdl2`가 표지를 만든 실행기와 다른 판이다 | 같음 |
+| `stale_done_marker:marker_unreadable` | 표지 파일이 깨졌다 | 같음 |
+| `job_output_missing` | 작업이 종료 코드 0인데 `--out` 산출물이 없다 | 작업 인자의 `--out`을 확인한다. 표지는 쓰지 않는다 |
+
+`baseline_ncc`·`eval_position`·`patches`·`data`는 numpy와 Pillow만 쓴다. `train`·`index`·`evaluate`·`make_split`은 import할 때, `search`는 실행할 때 torch를 쓴다. 이 검사는 각 작업을 시작하기 직전에 한다.
+
+#### 재시작 표지
+
+`--out`이 있는 작업은 성공(종료 코드 0)하면 `<out>.psdl2_done.json`을 쓴다. 내용은 `module`, `runner_payload_sha256`, `argv`, `input_sha256s`(인자에 적힌 기존 입력 파일), `outputs`(`--out`과 `--sheet-dir` 안의 파일 경로·sha256)다. 같은 폴더의 임시 파일을 `os.replace`로 바꾸므로 반쪽 표지가 남지 않는다.
+
+- 다시 실행하면 표지와 현재 상태(실행기 판·인자·입력·산출물 sha256)가 모두 같을 때 `skip completed <모듈>`을 로그에 남기고 건너뛴다. 1번 작업이 성공하고 2번이 실패했다면 고친 뒤 다시 실행했을 때 2번부터 돈다.
+- 하나라도 다르면 위 표의 `stale_done_marker:<사유>`로 멈춘다. 자동으로 덮어쓰거나 지우지 않는다.
+- 종료 코드 3(부분 결과)은 표지를 쓰지 않는다. `--out`이 없는 작업(`evaluate` 등)도 표지가 없고 매번 실행된다.
+- `baseline_ncc`의 `--sheet-dir`는 비어 있어야 하므로, 산출물을 다시 만들려면 표지와 함께 옛 `--out`·시트 폴더를 옮겨 둔다.
+
+#### 로컬에서 ETX 환경 재현
+
+ETX는 Python 3.9.14, numpy 1.23.5, Pillow 10.1.0, torch 2.1.1이다. 개발 venv(3.12, numpy 2.x)와 다르므로 실행기는 3.9 venv에서도 시험한다.
+
+```bash
+bash scripts/setup_etx_venvs.sh     # ~/.cache/psdl2-etx/ 에 venv39-notorch, venv39-torch (PyPI 1회 사용)
+PYTHONPATH=$PWD/src .venv/bin/python -m pytest tests/test_etx_runtime.py
+```
+
+- `venv39-notorch`: 3.9.14 + numpy 1.23.5 + Pillow 10.1.0. ETX 시험이 이 venv를 쓴다. `PSDL2_ETX_PY`로 다른 인터프리터를 지정한다.
+- `venv39-torch`: 위 + torch 2.1.1(CPU 빌드). `import torch`까지만 확인한다.
+- 스크립트는 설치된 판을 출력한다. 정확히 3.9.14를 못 받으면 가까운 3.9.x로 만들고 그 사실을 출력한다.
+- venv가 없으면 시험은 skip이 아니라 실패한다. 일부러 건너뛸 때만 `PSDL2_ALLOW_MISSING_ETX_PY=1`을 쓴다.
+- 이 시험은 합성 데이터로 `baseline_ncc` 두 방향 → `eval_position` 흐름, 비ASCII·공백 `BASE_DIR`, ASCII 콘솔, 위 오류 코드, 재시작을 확인한다. 실제 ETX(Linux 파일시스템 권한, CUDA, 실데이터 규모)는 확인하지 못한다.
+
 ## 3. 입력
 
 ### 3.1 ROI 목록 `review_rois.json` — schema `review_roi_v1`
