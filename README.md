@@ -128,3 +128,14 @@ exactly. V2-policy checkpoint/index inputs fail closed without migration.
 The array graph benchmark and finding-by-finding evidence are in
 [R4B_FIXES.md](docs/review/R4B_FIXES.md). G4/G6, actual connection semantics,
 real performance and independent candidate review remain pending.
+
+Multi-product DB search (summary: [PLAN_v3_db_search.md](docs/plan/PLAN_v3_db_search.md)).
+Four single-file ETX runners are built into `bundles/etx/`; steps are in [docs/USAGE.md §2.2](docs/USAGE.md#22-etxlinux-서버-단일-파일-실행):
+
+- `psdl2_job_baseline_ncc.py` — two-direction NCC baseline for the compare round 4 results (no torch).
+- `psdl2_job_smoke_torch.py` — synthetic smoke that checks the torch path on ETX (needs torch).
+- `psdl2_job_db_search.py` — per product: grid patches, split, train, index, then batch search (needs torch).
+- `psdl2_job_eval.py` — evaluates the NCC baseline and the DL2 batch search on the same truth (no torch).
+
+Output schemas `psdl2_search_batch_v1` and `psdl2_eval_position_multi_v1` are defined in
+[the data contract](docs/data_contract.md). Scores are for display only.

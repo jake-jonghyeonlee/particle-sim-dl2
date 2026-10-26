@@ -293,3 +293,78 @@ for a much larger frame, leave headroom or generate from a coarser template.
 A generator run that finds no admissible position anywhere is an error, not an empty file: exit 2, JSON `{"error": "no_patches_generated", "cases": [...funnel...]}`
 on stderr, nothing written, an existing output untouched. A shortage in only some cases is `patch_shortage` (exit 2) unless `--allow-shortage`
 records it in the header and exits 0. Exit code 3 is never used, because the single-file runner treats it as "continue".
+
+## `psdl2_search_batch_v1` — batch search envelope
+
+Written by `python -m psdl2.search --all-ready` (`src/psdl2/search.py:372-382`). The schema name is `BATCH_SCHEMA` (`src/psdl2/search.py:124`).
+The file is written once, atomically (same-folder temp file, `os.replace`; `src/psdl2/search.py:283-291`). A contract error in any query exits 2 and writes nothing.
+Exit code 0 means every query is `available`; 3 means at least one query has no primary candidate (`src/psdl2/search.py:386`).
+
+| Key | Type | Rule | Source |
+|---|---|---|---|
+| `schema_version` | string | always `psdl2_search_batch_v1` | `src/psdl2/search.py:372` |
+| `checkpoint_fingerprint`, `view_fingerprint` | string, 64 lowercase hex | copied from the index | `src/psdl2/search.py:372-373` |
+| `index_sources` | string or array | the string `"single_export"` when the index has no `sources`; else one object per source | `src/psdl2/search.py:225-250` |
+| `index_sources[].export_sha256` | string | the source's export hash | `src/psdl2/search.py:249` |
+| `index_sources[].patch_set_sha256s` | array of string | the source's patch-set hashes (may be empty) | `src/psdl2/search.py:244, 249` |
+| `index_sources[].product_ids` | sorted array of string, or `null` | products of index records made from that source's patch sets. A source without patch sets gets the products of records without patch provenance only when it is the single such source; with two or more such sources the value is `null` (unknown). `[]` means "no record came from this source" | `src/psdl2/search.py:235-248` |
+| `inputs.query_export_sha256` | string or `null` | sha256 of the `export` argument file; `null` when `--query-dataset` is used | `src/psdl2/search.py:374` |
+| `inputs.query_dataset_sha256` | string or `null` | sha256 of the `--query-dataset` manifest; `null` when `export` is used | `src/psdl2/search.py:375` |
+| `inputs.index_sha256` | string | sha256 of the `--index` file | `src/psdl2/search.py:376` |
+| `arguments.topk` | integer | as given | `src/psdl2/search.py:377` |
+| `arguments.expand`, `exclude_query_product`, `ignore_mask_derivation` | boolean | as given | `src/psdl2/search.py:377-379` |
+| `arguments.per_product_topk` | integer or `null` | `null` when the option is absent | `src/psdl2/search.py:377` |
+| `arguments.cohort` | sorted array of string | the cohort file's products | `src/psdl2/search.py:379` |
+| `results` | array | one single-query result per ready query ROI, sorted by `roi_id` | `src/psdl2/search.py:340, 364, 380` |
+| `rankings` | array | one entry per `results` item, same order | `src/psdl2/search.py:381` |
+
+**`results` identity contract.** `results[i]` is the value `search()` returns for that query with the same options (`src/psdl2/search.py:364`; the batch run only
+validates the index once, `src/psdl2/search.py:355-357`). It is the same as the output of a single `--roi-id` run for that query. The envelope adds nothing to it.
+
+**`rankings` derivation.** `derive_rankings` is the only place where rankings are built (`src/psdl2/search.py:209-222`):
+
+- Candidates are the `primary` rows in their order, then the `supplementary` rows in their order. `rank` starts at 1 and counts both lists in one sequence (`src/psdl2/search.py:215, 218-221`).
+- Each candidate has exactly `rank`, `roi_id`, `product_id`, `frame_id` (the row's `frame.frame_id`), `center_xy_um` and `search_scope` (`primary` or `supplementary`) (`src/psdl2/search.py:218-220`).
+- Each ranking has `query_roi_id`, `query_product_id`, `query_export_sha256` and `candidates` (`src/psdl2/search.py:216-217`).
+- `rankings[i].query_export_sha256` is the sha256 of the export the query ROI belongs to. For a single export it is the file's hash. For a dataset it is the hash of the query's source: a patch row maps through its patch-set hash, any other row through the roi ids of the source's export file. An unknown source is the error `query_export_unknown` (`src/psdl2/search.py:253-276`).
+  A reader must prefer this value; `inputs.query_export_sha256` is `null` for dataset queries.
+
+## `psdl2_eval_position_multi_v1` — multi-product position evaluation
+
+Written by `python -m psdl2.eval_position --search-batch <envelope>` or `--baseline <file> <file> ...` (two or more files) (`src/psdl2/eval_position.py:312-347`).
+The schema name is `MULTI_SCHEMA` (`src/psdl2/eval_position.py:140`). One `--baseline` file keeps the older `psdl2_position_eval_v1` mode (`src/psdl2/eval_position.py:348-356`).
+`--search-batch`, `--search` and `--baseline` exclude each other (`src/psdl2/eval_position.py:314-318`). `--include-supplementary` needs `--search-batch` (`src/psdl2/eval_position.py:327-328`).
+Output is written atomically with a trailing newline (`src/psdl2/eval_position.py:297-305, 345`). Exit code: 0 available, 3 unavailable, 2 contract error (`src/psdl2/eval_position.py:347, 357-359`).
+
+Top-level keys (`src/psdl2/eval_position.py:291-294, 343-344`): `schema_version`, `arguments`, `hit_tolerance_um`, `k`, `status`, `reasons`, `summary`, `per_product`, `queries`, `interpretation`.
+
+- `arguments`: `mode` (`search_batch` or `multi_baseline`), `search_batch` + `include_supplementary` or `baselines`, then `correspondence`, `hit_tolerance_um`, `k` (`src/psdl2/eval_position.py:334-342`).
+- `status`: `available` when `n_queries_with_prediction > 0`, else `unavailable`. `reasons` is `[]` when available, otherwise `no_evaluable_queries` (truth exists, no prediction) or `no_queries_with_truth` (`src/psdl2/eval_position.py:290-292`).
+
+**Two denominators** (`src/psdl2/eval_position.py:271-289`):
+
+| Key | Denominator |
+|---|---|
+| `top1_hit_rate`, `hit_rate_at_<k>` | `n_queries_with_truth`: all queries that have a ready truth label. A query without any prediction counts as a miss. `null` when there is no truth |
+| `top1_hit_rate_among_predicted`, `hit_rate_at_<k>_among_predicted` | `n_queries_with_prediction`: truth queries with at least one candidate. `null` when there is none |
+
+Other `summary` keys (`src/psdl2/eval_position.py:279-289`): `n_queries_without_prediction` (= truth − prediction), `n_prediction_queries_without_truth`, `n_duplicate_predictions_ignored`, `n_top1_hit`, `n_hit_at_k`, `mean_top1_distance_um`, `median_top1_distance_um`, `baseline_missing_for_truth_product`.
+
+**`per_product`** (`src/psdl2/eval_position.py:252-258, 276-278`): keyed by truth product, sorted. Each value has `n_queries_with_truth`, `n_queries_with_prediction`, `n_top1_hit`, `n_hit_at_k`, `top1_hit_rate`, `hit_rate_at_<k>`. Both rates use `n_queries_with_truth` of that product. A query with truth in two products counts once in each.
+
+**`baseline_missing_for_truth_product`** (`src/psdl2/eval_position.py:232-235, 240-241, 289`): in multi-baseline mode, a truth product with no baseline file. The query stays in the denominator as a miss, the entry reason is `baseline_missing_for_truth_product`, and the product is listed here (sorted).
+
+**Prediction and hit rules.**
+
+- Batch mode: one prediction per query, the query's whole `rankings[i].candidates`. Only `primary` candidates count unless `--include-supplementary`; ranks are renumbered from 1 after the filter. A `search_scope` other than `primary`/`supplementary` is `unsupported_search_scope` (`src/psdl2/eval_position.py:144-158`).
+- Multi-baseline mode: one prediction per (query, candidate product); the file's `candidate_product_id` names the product (`src/psdl2/eval_position.py:161-179`).
+- A query is judged per truth product by the prediction that covers that product (`src/psdl2/eval_position.py:230-237`). The query is a hit when any truth product is a hit; its `first_hit_rank` and `top1_distance_um` are the best over the available products (`src/psdl2/eval_position.py:265-269`).
+- Hit: the candidate has the same product and frame as a truth label, its centre is within `--hit-tolerance-um`, and it is among the first `k` (`src/psdl2/eval_position.py:182-195`). Scores are not compared or re-ranked across products.
+- Entry reasons: `no_prediction`, `no_candidates`, `baseline_missing_for_truth_product`; the query reason is `<product>:<reason>` (`src/psdl2/eval_position.py:241-245, 264`).
+
+**Duplicate rules.**
+
+- Same (query, product) key repeated with identical candidates: ignored and counted in `n_duplicate_predictions_ignored`. Different candidates: `duplicate_query_prediction_conflict: <query>` (`src/psdl2/eval_position.py:212-219`).
+- The same (query, candidate product) in two different baseline files: `duplicate_candidate_product: <query> / <product>` (`src/psdl2/eval_position.py:174-176`).
+- A candidate whose `product_id` differs from its file's `candidate_product_id`: `candidate_product_mismatch: <query> / <product>` (`src/psdl2/eval_position.py:172-173`).
+- Truth comes from `roi_correspondence_v1` rows with `status == "ready"` and a non-null `a.roi_id`; side `b` gives the truth product, frame and centre (`src/psdl2/eval_position.py:27-42`).

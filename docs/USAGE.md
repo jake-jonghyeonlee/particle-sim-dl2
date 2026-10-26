@@ -234,6 +234,8 @@ PY=.venv-gpu/Scripts/python.exe
 
 두 번들 모두 수치 기본값이 없다. 사용자가 정할 값은 EDIT 블록에 `FILL_ME`로 있고, 하나라도 남아 있으면 **어떤 작업도 돌기 전에** `edit_value_required: <이름들>`(영어 문구 + 한글 조치 문구)로 종료 코드 2로 멈춘다. 입력 파일 경로는 예시 이름(`productA` 등)이고, 시작할 때 모두 있는지 보아 없으면 `input_missing: <EDIT 이름> -> <해석된 경로>`로 멈춘다. 상대 경로는 `BASE_DIR` 기준이다.
 
+요약과 compare 쪽 요청 목록은 [PLAN_v3_db_search.md](plan/PLAN_v3_db_search.md)에 있다.
+
 회차 위치(compare): 질의 = **변경점 ROI export**, DB·후보 = **제품별 template export**. compare의 새 "변경점" 형식은 미확정이다. 지금은 `review_roi_v1` manual 행 + `mask_derivation.json`으로 만든 export를 가정한다(PLAN D2). 4·5회차용 `psdl2_job_baseline_ncc.py`와는 별개다.
 
 **`psdl2_job_db_search.py`** (torch 필요, 로그: `runs/psdl2_db_search.log`)
