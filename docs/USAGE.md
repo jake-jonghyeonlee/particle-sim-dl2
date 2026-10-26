@@ -224,11 +224,39 @@ PY=.venv-gpu/Scripts/python.exe
 - 실행하면 합성 fixture(호환 제품 3개 `P0`~`P2` + 음성 제품 `N`)를 `BASE_DIR/psdl2_smoke/` 아래에 만든다. 음성 제품은 `mask_derivation`이 달라 어떤 질의와도 호환되지 않으며 `rejected`로만 나온다. 이어서 `patches`(random·grid) → `make_split` → `train`(1 epoch) → `index` → `search --all-ready --exclude-query-product --per-product-topk 2` → `eval_position --search-batch`(합성 `roi_correspondence_v1`: 질의 `Pi_case0`의 정답은 다음 제품의 중심)를 돌리고, 끝에서 결과를 확인한다(질의마다 후보가 있고, 질의 제품과 음성 제품 후보가 없고, 평가 출력이 `psdl2_eval_position_multi_v1`이며 정답 질의가 3개다). 합성 정답은 평가 단계가 끝까지 도는지만 본다. hit 수는 확인하지 않는다. 제품마다 영상이 조금 다르다(`P0`~`P2`는 첫 막대의 굵기, `N`은 막대가 가로로 누워 있다). 다시 실행하면 평가 출력과 완료 표지를 지우고 새로 만든다. 실패하면 `smoke_check_failed`로 멈춘다. 실행기 맨 위 버전 줄에는 python·numpy·PIL·setuptools·torch 판이 나오고, CUDA 확인이 실패하면 `cuda check failed: <예외 형식>`만 남기고 torch는 쓸 수 있는 것으로 본다.
 - 다시 실행하면 같은 폴더를 같은 바이트로 덮어쓴다(`patches`·`make_split`은 `--overwrite`).
 - 각 단계의 시작·종료 코드와 python·numpy·Pillow·torch·`cuda available:` 판이 로그에 남는다. torch가 없으면 numpy만 쓰는 `patches` 8개가 돈 뒤 첫 torch 작업(`make_split`)에서 `torch_required_for_make_split`로 종료 코드 2다.
-- 이 번들은 `train`·`index`·`search`·`make_split` 작업이라 완료 표지를 쓰지 않는다.
+- 완료 표지는 `eval_position` 작업만 쓴다(`eval_position.json.psdl2_done.json`). `patches`·`make_split`·`train`·`index`·`search`는 쓰지 않는다. 합성 fixture 준비가 다시 실행 때 이 표지와 평가 출력을 지우므로 이 번들은 건너뛰지 않고 매번 끝까지 돈다.
+
+#### 실데이터 실행기 2종 (DB 검색, 평가)
+
+```bash
+.venv/bin/python scripts/build_etx_jobs.py --overwrite   # bundles/etx/psdl2_job_db_search.py, psdl2_job_eval.py
+```
+
+두 번들 모두 수치 기본값이 없다. 사용자가 정할 값은 EDIT 블록에 `FILL_ME`로 있고, 하나라도 남아 있으면 **어떤 작업도 돌기 전에** `edit_value_required: <이름들>`(영어 문구 + 한글 조치 문구)로 종료 코드 2로 멈춘다. 입력 파일 경로는 예시 이름(`productA` 등)이고, 시작할 때 모두 있는지 보아 없으면 `input_missing: <EDIT 이름> -> <해석된 경로>`로 멈춘다. 상대 경로는 `BASE_DIR` 기준이다.
+
+회차 위치(compare): 질의 = **변경점 ROI export**, DB·후보 = **제품별 template export**. compare의 새 "변경점" 형식은 미확정이다. 지금은 `review_roi_v1` manual 행 + `mask_derivation.json`으로 만든 export를 가정한다(PLAN D2). 4·5회차용 `psdl2_job_baseline_ncc.py`와는 별개다.
+
+**`psdl2_job_db_search.py`** (torch 필요, 로그: `runs/psdl2_db_search.log`)
+
+- 작업 순서: 제품마다 `patches --mode grid` → `make_split` → `train` → `index --dataset` → `search --all-ready --query-dataset … --exclude-query-product [--per-product-topk]`. 학습과 색인은 같은 grid patch manifest를 쓴다. 이 manifest(`<DB_DATASET 이름>.grid.json`)는 실행 시작 때 `DB_DATASET`과 같은 폴더에 자동으로 쓴다(`DB_DATASET`의 source마다 `patch_sets`만 붙인 사본; 원본은 건드리지 않는다).
+- 입력(예시 이름): `DB_DATASET`(`psdl2_dataset_v1`, 제품마다 template export 한 source, `patch_sets` 없음, 이름은 `.json`으로 끝남), `QUERY_DATASET`, `LINEAGES`, `ASSIGN`. 정할 값(`FILL_ME`): `CONFIG`, `COHORT`, `GRID_STEP_UM`, `TOPK`, `PER_PRODUCT_TOPK`(숫자 또는 `None` = 쓰지 않음). `PRODUCTS`는 `DB_DATASET`의 source와 같은 순서·같은 개수의 이름이고 patch set 파일 이름에만 쓰인다(개수가 다르면 `input_mismatch`, 이름이 겹치거나 문자가 이상하면 `edit_value_invalid`).
+- 출력: `OUT_DIR`(예시 `dl2_db/out`) 아래 `grid_<제품>.json`, `split.json`, `model.pt`, `index.json`, `search_batch.json`(`psdl2_search_batch_v1`). 끝에서 질의 수와 후보 없는 질의 수를 로그에 남긴다.
+- torch 작업(`make_split` 이후)은 완료 표지를 쓰지 않아 매번 다시 돈다. torch가 없는 Python이면 numpy만 쓰는 `patches`가 먼저 돌고 첫 torch 작업에서 `torch_required_for_make_split`로 멈춘다.
+- `--allow-unversioned-producer`를 모든 작업에 넣는다(ETX 실행기로 만든 export에는 `producer_commit`이 없다). `train`은 진행 줄(JSON)을 로그에 남긴다.
+
+**`psdl2_job_eval.py`** (torch 불필요, 로그: `runs/psdl2_eval.log`)
+
+- 작업 순서: 후보 제품마다 `baseline_ncc --all-ready`(질의 export ↔ 그 제품의 template export) → `eval_position --baseline <제품별 파일 전부>` → `eval_position --search-batch <db_search 봉투>`. 앞의 둘이 같은 정답에 대한 두 방법의 hit를 낸다. NCC 점수와 코사인 점수는 비교하지 않는다.
+- 입력(예시 이름): `QUERY_EXPORT`, `CANDIDATES`(제품마다 `(이름, template export)`), `CORRESPONDENCE`(`roi_correspondence_v1`), `SEARCH_BATCH`(db_search 실행기의 `OUT_DIR/search_batch.json`). 정할 값(`FILL_ME`): `WINDOW_UM`, `NCC_TOPK`, `MAX_MEMORY_MB`, `HIT_TOLERANCE_UM`, `K`.
+- 정답(`roi_correspondence_v1`)이 없으면 EDIT 블록의 `JOBS = NCC_JOBS + EVAL_JOBS`를 `JOBS = NCC_JOBS`로 바꾼다. 그러면 평가 작업과 `CORRESPONDENCE`·`SEARCH_BATCH` 검사, `HIT_TOLERANCE_UM`·`K` 요구가 빠진다.
+- `baseline_ncc`·`eval_position`은 완료 표지를 써서 다시 실행하면 `skip completed`로 건너뛴다. 후보 제품이 하나뿐이면 `eval_position --baseline`은 단일 모드(`psdl2_position_eval_v1`)다. 끝에서 평가 출력의 요약(질의 수, top-1·top-k hit 수)을 로그에 남긴다.
+- 출력: `OUT_DIR`(예시 `dl2_eval/out`) 아래 `ncc_<제품>.json`, `ncc_<제품>_sheet/`, `eval_baseline.json`, `eval_search_batch.json`.
+
+오류 코드 추가: `edit_value_required`, `edit_value_invalid`, `input_missing`, `input_invalid`(`DB_DATASET`이 manifest가 아님), `input_mismatch`. 모두 위 오류 코드 표와 같은 한 줄 형식(종료 코드 2)이다. 시험(`tests/test_etx_jobs.py`)이 합성 데이터로 db_search(`venv39-torch`) → eval(`venv39-notorch`) 전체 흐름, 비ASCII·공백 `BASE_DIR`, `-I`, 다른 작업 폴더, 재시작을 확인한다. CUDA, 실제 Linux, 실데이터 규모·메모리·시간은 확인하지 못한다.
 
 #### D10 기준 commit 갱신 절차
 
-ETX `baseline_ncc` 번들의 `baseline_ncc` import 폐포(`baseline_ncc.py`, `data.py`, `eval_position.py`, `schema.py` 등)는 기준 commit의 소스와 바이트까지 같아야 한다. 기준 commit은 `tests/test_etx_runtime.py`의 상수 `D10_BASELINE_COMMIT`(현재 `36ff7dc`)이다. 폐포 모듈을 **일부러** 바꾸는 Task는 이 상수를 그 Task의 기준 commit으로 옮기고, 이유를 commit 메시지에 쓴다. 바꾼 모듈은 `D10_CHANGED_SINCE_BASELINE`에 적는다(현재 `psdl2/eval_position.py`: 번들 안의 바이트가 작업 폴더의 소스와 같아야 하고, 기준 commit과는 달라야 한다). `search`·`index`·`train` 등 폐포 밖 모듈만 바꾸는 Task는 이 상수를 그대로 둔다(폐포에 `search`가 없음을 시험이 확인한다).
+ETX `baseline_ncc` 번들의 `baseline_ncc` import 폐포(`baseline_ncc.py`, `data.py`, `eval_position.py`, `schema.py` 등)는 기준 commit의 소스와 바이트까지 같아야 한다. 기준 commit은 `tests/test_etx_runtime.py`의 상수 `D10_BASELINE_COMMIT`(현재 `e0402d0`)이다. 폐포 모듈을 **일부러** 바꾸는 Task는 이 상수를 그 Task의 기준 commit으로 옮기고, 이유를 commit 메시지에 쓴다. 바꾼 모듈은 `D10_CHANGED_SINCE_BASELINE`에 적는다(현재 `psdl2/eval_position.py`: 번들 안의 바이트가 작업 폴더의 소스와 같아야 하고, 기준 commit과는 달라야 한다). `search`·`index`·`train` 등 폐포 밖 모듈만 바꾸는 Task는 이 상수를 그대로 둔다(폐포에 `search`가 없음을 시험이 확인한다).
 
 D10의 실제 보장은 따로 있다. "`efc6dac` 번들과 현재 번들이 기존 흐름(`baseline_ncc` 두 방향 → 단일 `--baseline` 평가)에서 같은 바이트의 출력을 낸다"는 시험이고, 기준은 옮기지 않는 상수 `D10_OUTPUT_COMMIT`(`efc6dac`)이다. 단일 `--search`·`--baseline` 평가가 `efc6dac`의 `eval_position.py`와 바이트까지 같다는 시험(`tests/test_eval_multi.py`, `EVAL_GOLDEN_COMMIT`)과 단일 검색 출력이 `efc6dac`의 `search.py`와 같다는 시험(`tests/test_search_batch.py`, `SEARCH_GOLDEN_COMMIT`)도 이 commit에 묶여 있다.
 
@@ -680,7 +708,7 @@ ready 행과 blocked 행의 수, blocked 사유, producer 정보가 JSON으로 �
 단위는 질의다. 정답은 `roi_correspondence_v1`의 질의별 (정답 제품, frame, 위치) 목록이고, 정답이 있는 질의가 분모다(제품 가중 없음).
 
 - `--search-batch`: 질의 하나의 `rankings[i].candidates` 전체가 한 prediction이다. 기본은 `search_scope == "primary"` 후보만 센다. `--include-supplementary`를 줘야 supplementary 후보도 포함하고, 출력 `arguments.include_supplementary`에 기록한다.
-- `--baseline` 파일 2개 이상: 파일마다 후보 제품이 하나(`candidate_product_id`)다. prediction 키는 `(질의, 후보 제품)`이다. 같은 키가 두 파일에 있으면 `duplicate_candidate_product`로 종료 코드 2다. 같은 질의가 제품 B 파일과 제품 C 파일에 서로 다른 후보로 있는 것은 충돌이 아니다.
+- `--baseline` 파일 2개 이상: 파일마다 후보 제품이 하나(`candidate_product_id`)다. prediction 키는 `(질의, 후보 제품)`이다. 같은 키가 **서로 다른** 두 파일에 있으면 `duplicate_candidate_product`로 종료 코드 2다. 같은 파일 안의 반복은 단일 규칙을 따른다(같은 내용이면 무시하고 `n_duplicate_predictions_ignored`에 센다, 다르면 `duplicate_query_prediction_conflict`). 파일의 후보 행 `product_id`가 그 파일의 `candidate_product_id`와 다르면 `candidate_product_mismatch`로 종료 코드 2다. 같은 질의가 제품 B 파일과 제품 C 파일에 서로 다른 후보로 있는 것은 충돌이 아니다.
 - hit: 같은 제품·frame의 정답 중심에서 `--hit-tolerance-um` 이내이고 prediction의 앞 `--k`개 안에 있다(기존 `psdl2_position_eval_v1`과 같은 판정). 점수는 제품 사이에서 비교하거나 재순위하지 않는다.
 - 질의는 정답 제품마다 그 제품을 덮는 prediction으로 판정한다(배치는 질의의 랭킹 전체, 다중 baseline은 그 제품 파일의 prediction). 정답 제품이 여럿이면 하나라도 hit면 질의 hit다.
 - `--search-batch`, `--search`, `--baseline`은 서로 배타다. `--baseline` 파일이 하나면 기존 모드(`psdl2_position_eval_v1`)다. `--include-supplementary`는 `--search-batch`와만 쓴다.

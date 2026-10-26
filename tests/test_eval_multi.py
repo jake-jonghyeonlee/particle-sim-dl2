@@ -192,7 +192,62 @@ def test_the_same_query_and_product_in_two_files_is_an_error(tmp_path, capsys):
     disjoint = baseline_file(tmp_path / 'B3.json', 'B', {'qb9': [('FB', (1.0, 1.0))]})
     code, result, _, err = run_json(capsys, tmp_path / 'ok.json', '--baseline', b_file, disjoint, '--correspondence', truth,
                                     '--hit-tolerance-um', TOLERANCE, '--k', 3)
-    assert code == 0, err and result['summary']['n_prediction_queries_without_truth'] == 1
+    assert code == 0, err
+    assert result['summary']['n_prediction_queries_without_truth'] == 1
+
+
+def test_a_repeated_query_inside_one_file_follows_the_single_rule(tmp_path, capsys):
+    """adv:2: inside one file an identical repeat is ignored and counted, a different one is a conflict; never duplicate_candidate_product."""
+    truth = truth_file(tmp_path / 'truth.json', [('q', 'B', 'F', (1.0, 1.0))])
+    row = {'rank': 1, 'score': 1.0, 'center_xy_um': [1.0, 1.0], 'product_id': 'B', 'frame_id': 'F'}
+    other = dict(row, center_xy_um=[9.0, 9.0])
+
+    def file(name, *candidate_lists):
+        results = [{'query': {'roi_id': 'q'}, 'status': 'available', 'primary': [c]} for c in candidate_lists]
+        return write_json(tmp_path / name, {'schema_version': 'psdl2_baseline_ncc_v1', 'candidate_product_id': 'B', 'results': results})
+
+    common = ['--correspondence', truth, '--hit-tolerance-um', TOLERANCE, '--k', 1]
+    same = file('same.json', row, row)
+    elsewhere = baseline_file(tmp_path / 'C.json', 'C', {'zz': []})
+    code, result, _, err = run_json(capsys, tmp_path / 'inside.json', '--baseline', same, elsewhere, *common)
+    assert code == 0, err
+    assert result['summary']['n_duplicate_predictions_ignored'] == 1 and result['summary']['n_hit_at_k'] == 1
+    conflicting = file('conflict.json', row, other)
+    out = tmp_path / 'never.json'
+    code, stdout, err = run(capsys, '--baseline', conflicting, elsewhere, *common, '--out', out)
+    assert code == 2 and stdout == '' and json.loads(err) == {'error': 'duplicate_query_prediction_conflict: q'} and not out.exists()
+    # the same (query, product) in two different files stays duplicate_candidate_product, even when the rows are identical
+    code, stdout, err = run(capsys, '--baseline', same, file('twin.json', row), *common, '--out', out)
+    assert code == 2 and json.loads(err) == {'error': 'duplicate_candidate_product: q / B'} and not out.exists()
+
+
+def test_a_repeated_query_in_a_batch_envelope_still_follows_the_same_rule(tmp_path, capsys):
+    truth = truth_file(tmp_path / 'truth.json', [('q', 'B', 'F', (1.0, 1.0))])
+    ranking = {'query_roi_id': 'q', 'query_product_id': 'Q', 'query_export_sha256': None,
+               'candidates': [{'rank': 1, 'roi_id': 'r1', 'product_id': 'B', 'frame_id': 'F', 'center_xy_um': [1.0, 1.0], 'search_scope': 'primary'}]}
+    moved = json.loads(json.dumps(ranking))
+    moved['candidates'][0]['center_xy_um'] = [9.0, 9.0]
+    common = ['--correspondence', truth, '--hit-tolerance-um', TOLERANCE, '--k', 1]
+    same = write_json(tmp_path / 'same.json', {'schema_version': 'psdl2_search_batch_v1', 'rankings': [ranking, ranking]})
+    code, result, _, err = run_json(capsys, tmp_path / 'a.json', '--search-batch', same, *common)
+    assert code == 0, err
+    assert result['summary']['n_duplicate_predictions_ignored'] == 1
+    different = write_json(tmp_path / 'different.json', {'schema_version': 'psdl2_search_batch_v1', 'rankings': [ranking, moved]})
+    code, stdout, err = run(capsys, '--search-batch', different, *common, '--out', tmp_path / 'never.json')
+    assert code == 2 and json.loads(err) == {'error': 'duplicate_query_prediction_conflict: q'}
+
+
+def test_a_file_whose_candidates_belong_to_another_product_is_rejected(tmp_path, capsys):
+    """adv:8: the product of a file is its candidate_product_id; a candidate row of another product would be judged under the wrong label."""
+    truth = truth_file(tmp_path / 'truth.json', [('q', 'B', 'F', (1.0, 1.0))])
+    good = baseline_file(tmp_path / 'B.json', 'B', {'q': [('F', (1.0, 1.0))]})
+    wrong = baseline_file(tmp_path / 'C.json', 'C', {'q': [('F', (1.0, 1.0))]})
+    payload = json.loads(wrong.read_text())
+    payload['candidate_product_id'] = 'D'   # the file says D, its candidate row says C
+    write_json(wrong, payload)
+    out = tmp_path / 'never.json'
+    code, stdout, err = run(capsys, '--baseline', good, wrong, '--correspondence', truth, '--hit-tolerance-um', TOLERANCE, '--k', 1, '--out', out)
+    assert code == 2 and stdout == '' and json.loads(err) == {'error': 'candidate_product_mismatch: q / D'} and not out.exists()
 
 
 # ---------------------------------------------------------------- regression fixtures
@@ -390,3 +445,38 @@ def test_a_real_baseline_payload_joins_the_multi_mode(tmp_path, capsys):
                                     '--hit-tolerance-um', 0.5, '--k', 2)
     assert code == 0, err
     assert result['summary']['n_hit_at_k'] == 1 and result['summary']['n_top1_hit'] == 1 and list(result['per_product']) == ['B']
+
+
+# ---------------------------------------------------------------- adv:7 the two judges agree; frame mismatch in the new modes
+
+def test_judge_and_evaluate_positions_agree_on_random_candidates():
+    """`_judge` (multi mode) must decide hits exactly like `evaluate_positions` (single mode): seeded random cases, no I/O."""
+    import random
+    rng = random.Random(20261026)
+    products, frames = ('B', 'C'), ('F1', 'F2')
+    for case in range(40):
+        labelled = [{'pair_id': 'T%d' % i, 'product_id': rng.choice(products), 'frame_id': rng.choice(frames),
+                     'center_xy_um': [rng.uniform(0, 10), rng.uniform(0, 10)], 'roi_id': None} for i in range(rng.randint(1, 3))]
+        candidates = [{'rank': rank, 'roi_id': 'c%d' % rank, 'product_id': rng.choice(products), 'frame_id': rng.choice(frames),
+                       'center_xy_um': [rng.uniform(0, 10), rng.uniform(0, 10)], 'score': rng.random()} for rank in range(1, rng.randint(2, 7))]
+        k, tolerance = rng.randint(1, 5), rng.choice((0.5, 2.0, 5.0))
+        result = eval_module.evaluate_positions([{'query_roi_id': 'q', 'status': 'available', 'candidates': candidates, 'source': 's'}],
+                                                {'q': labelled}, tolerance_um=tolerance, k=k)
+        row = result['queries'][0]
+        rows, first_hit = eval_module._judge(candidates, labelled, tolerance, k)
+        assert [{key: v for key, v in r.items() if key != 'product_id'} for r in rows] == row['candidates'], case
+        assert first_hit == row['first_hit_rank'], case
+
+
+def test_a_candidate_in_the_right_place_but_another_frame_is_no_hit_in_the_new_modes(tmp_path, capsys):
+    truth = truth_file(tmp_path / 'truth.json', [('q', 'B', 'F', (1.0, 1.0))])
+    common = ['--correspondence', truth, '--hit-tolerance-um', TOLERANCE, '--k', 2]
+    single = baseline_file(tmp_path / 'B.json', 'B', {'q': [('OTHER', (1.0, 1.0))]})
+    other = baseline_file(tmp_path / 'C.json', 'C', {'zz': []})
+    envelope = batch_file(tmp_path / 'batch.json', {'q': [('primary', 'B', 'OTHER', (1.0, 1.0))]})
+    for mode in (['--baseline', single, other], ['--search-batch', envelope]):
+        code, result, _, err = run_json(capsys, tmp_path / 'out.json', *mode, *common)
+        assert code == 0, err
+        entry = result['queries'][0]['by_product']['B']
+        assert entry['top1_hit'] is False and entry['hit_at_k'] is False and entry['top1_distance_um'] is None
+        assert entry['candidates'][0]['reason'] == 'product_or_frame_mismatch' and result['summary']['n_hit_at_k'] == 0

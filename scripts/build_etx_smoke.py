@@ -210,31 +210,31 @@ def _check(base):
     """search 결과가 계약대로인지 본다: 질의마다 후보가 있고, 질의 제품·음성 제품 후보가 없다."""
     path = Path(base) / SMOKE_DIR / "out" / "search_batch.json"
 
-    def bad(reason):
-        _fail("smoke_check_failed", f"the smoke result {path.name} is not as expected: {reason}",
-              f"smoke 결과 {path.name} 가 기대와 다르다: {reason}")
+    def bad(step, name, reason):
+        _fail("smoke_check_failed", f"the output of step {step} ({name}) is not as expected: {reason}",
+              f"{step} 단계의 출력 {name} 가 기대와 다르다: {reason}")
 
     if not path.is_file():
-        bad("the file is missing")
+        bad("search", path.name, "the file is missing")
     batch = json.loads(path.read_text(encoding="utf-8"))
     if batch.get("schema_version") != "psdl2_search_batch_v1":
-        bad("schema_version")
+        bad("search", path.name, "schema_version")
     results, rankings = batch["results"], batch["rankings"]
     if len(results) != len(PRODUCTS) or len(rankings) != len(PRODUCTS):
-        bad(f"expected {len(PRODUCTS)} queries, got {len(results)}")
+        bad("search", path.name, f"expected {len(PRODUCTS)} queries, got {len(results)}")
     for result, ranking in zip(results, rankings):
         query_product = ranking["query_product_id"]
         if result["status"] != "available" or not ranking["candidates"]:
-            bad(f"query {ranking['query_roi_id']} has no candidates")
+            bad("search", path.name, f"query {ranking['query_roi_id']} has no candidates")
         products = {row["product_id"] for row in ranking["candidates"]}
         if query_product in products or NEGATIVE in products:
-            bad(f"query {ranking['query_roi_id']} got candidates of {sorted(products)}")
+            bad("search", path.name, f"query {ranking['query_roi_id']} got candidates of {sorted(products)}")
     evaluation = Path(base) / SMOKE_DIR / "out" / "eval_position.json"
     if not evaluation.is_file():
-        bad("the eval_position output is missing")
+        bad("eval_position", evaluation.name, "the file is missing")
     summary = json.loads(evaluation.read_text(encoding="utf-8"))
     if summary.get("schema_version") != "psdl2_eval_position_multi_v1" or summary["summary"]["n_queries_with_truth"] != len(PRODUCTS):
-        bad("the eval_position output has the wrong schema or query count")
+        bad("eval_position", evaluation.name, "wrong schema or query count")
     _smoke_log(f"eval check OK: {summary['summary']['n_hit_at_k']} of {len(PRODUCTS)} queries hit within the top 4")
     _smoke_log("smoke check OK: " + ", ".join(f"{r['query_roi_id']} -> {len(r['candidates'])} candidates" for r in rankings))
 '''

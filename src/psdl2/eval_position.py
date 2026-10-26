@@ -160,16 +160,19 @@ def predictions_from_batch(payload, *, include_supplementary=False):
 
 def predictions_from_baselines(payloads):
     """One prediction per (query, candidate product); the product of a file is its ``candidate_product_id``."""
-    predictions, seen = [], set()
-    for payload in payloads:
+    """A repeat of (query, product) inside one file follows the single rule of ``evaluate_multi`` (identical = ignored and
+    counted, different = conflict); the same pair in two different files is ``duplicate_candidate_product``."""
+    predictions, owner = [], {}
+    for number, payload in enumerate(payloads):
         if not isinstance(payload, dict) or payload.get('schema_version') != 'psdl2_baseline_ncc_v1':
             raise ContractError('unsupported_baseline_result')
         product = text(payload.get('candidate_product_id'))
         for prediction in predictions_from_baseline(payload):
+            if any(c['product_id'] != product for c in prediction['candidates']):
+                raise ContractError('candidate_product_mismatch: %s / %s' % (prediction['query_roi_id'], product))
             key = (prediction['query_roi_id'], product)
-            if key in seen:
+            if owner.setdefault(key, number) != number:
                 raise ContractError('duplicate_candidate_product: %s / %s' % key)
-            seen.add(key)
             prediction['candidate_product_id'] = product
             predictions.append(prediction)
     return predictions
@@ -208,7 +211,7 @@ def evaluate_multi(predictions, truths, *, tolerance_um, k, baseline_products=No
     for prediction in predictions:
         key = (prediction['query_roi_id'], prediction['candidate_product_id'])
         if key in by_key:
-            if prediction['candidate_product_id'] is not None or prediction['candidates'] != by_key[key]['candidates']:
+            if prediction['candidates'] != by_key[key]['candidates']:
                 raise ContractError('duplicate_query_prediction_conflict: ' + prediction['query_roi_id'])
             ignored += 1
             continue

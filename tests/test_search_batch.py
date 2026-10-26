@@ -265,8 +265,9 @@ def test_index_sources_product_ids_are_null_when_unknown():
     assert index_sources({'records': []}) == 'single_export'
 
 
-def test_negative_product_never_wins_even_with_the_mask_derivation_check_off(world, capsys):
-    """adv:3: the negative product has a different image, so ignoring its mask_derivation does not make it a tie."""
+def test_negative_product_scores_below_one_and_loses_to_an_exact_copy_with_the_check_off(world, capsys):
+    """adv:3/4: with the mask_derivation check off, every N row scores below 1.0 (its image differs), and a query that is an exact
+    copy of an indexed P0 record ranks a P0 row first at 1.0, so N cannot take first place."""
     for roi in QUERIES:
         result, _ = single(world, capsys, roi, '--ignore-mask-derivation', topk=100)
         negative = [r for r in result['primary'] if r['product_id'] == 'N']
@@ -281,6 +282,26 @@ def test_negative_product_never_wins_even_with_the_mask_derivation_check_off(wor
     scores = {r['roi_id']: r['score'] for r in result['primary']}
     assert scores[original['roi_id']] == 1.0 and result['primary'][0]['score'] == 1.0 and result['primary'][0]['product_id'] != 'N'
     assert max(r['score'] for r in result['primary'] if r['product_id'] == 'N') < 1.0
+
+
+def test_query_export_sha256s_maps_patch_rows_by_their_set_and_plain_rows_by_their_export(tmp_path):
+    """adv:5: the `by_set` branch (patch rows) and the `by_roi` branch (rows of a source without patch sets), and `query_export_unknown`."""
+    plain = tmp_path / 'plain' / 'review_rois.json'
+    plain.parent.mkdir()
+    plain.write_text(json.dumps({'rois': [{'roi_id': 'plain_roi'}]}))
+    imported = types.SimpleNamespace(sources=[
+        {'export': 'unused.json', 'export_sha256': 'export_patched', 'patch_sets': [{'sha256': 'set_a'}, {'sha256': 'set_b'}]},
+        {'export': 'plain/review_rois.json', 'export_sha256': 'export_plain'}])
+
+    def roi(patch_set=None, roi_id='x'):
+        return types.SimpleNamespace(patch={'set_sha256': patch_set} if patch_set else None, row={'roi_id': roi_id})
+
+    manifest = tmp_path / 'dataset.json'
+    got = search_module.query_export_sha256s(imported, [roi('set_b'), roi(roi_id='plain_roi'), roi('set_a')], manifest_path=manifest)
+    assert got == ['export_patched', 'export_plain', 'export_patched']
+    for unknown in (roi('set_unknown'), roi(roi_id='no_such_roi')):
+        with pytest.raises(ContractError, match='query_export_unknown'):
+            search_module.query_export_sha256s(imported, [unknown], manifest_path=manifest)
 
 
 def test_a_contract_error_in_a_batch_names_the_query(world, capsys, monkeypatch):

@@ -31,7 +31,8 @@ SRC = ROOT / 'src'
 # A Task that changes a closure module on purpose moves this constant to that Task's base commit and says why in the
 # commit message. Tasks that touch other modules (search, index, train, ...) leave it alone.
 # T3 (dl2-db/T3) moved it from efc6dac to 36ff7dc because it adds the multi-product mode to eval_position.py.
-D10_BASELINE_COMMIT = '36ff7dc35c8bc8a8599a85ae4af5b15f537cb00a'
+# T6 (dl2-db/T6) moved it to e0402d0 (its base commit) because it changes eval_position.py again (T3 review adv:2, adv:8).
+D10_BASELINE_COMMIT = 'e0402d07f59bc1281a61579bee2e6153265fd803'
 D10_CHANGED_SINCE_BASELINE = ('psdl2/eval_position.py',)
 # The real D10 guarantee is separate: the baseline_ncc bundle of this commit writes the same output bytes as the bundle of
 # this older commit for the existing single-search / single-baseline flow. It never moves.
@@ -751,8 +752,9 @@ def python310_findings(path, source):
 
 
 def test_no_python310_syntax_or_api_in_sources_and_bundle():
-    paths = [*_sources(), COMMITTED, SMOKE, ROOT / 'scripts/build_single_file.py', ROOT / 'scripts/build_etx_runner.py',
-             ROOT / 'scripts/build_etx_smoke.py']
+    paths = [*_sources(), COMMITTED, SMOKE, ROOT / 'bundles/etx/psdl2_job_db_search.py', ROOT / 'bundles/etx/psdl2_job_eval.py',
+             ROOT / 'scripts/build_single_file.py', ROOT / 'scripts/build_etx_runner.py', ROOT / 'scripts/build_etx_smoke.py',
+             ROOT / 'scripts/build_etx_jobs.py']
     found = {str(p.relative_to(ROOT)): python310_findings(p, p.read_text(encoding='utf-8')) for p in paths}
     assert {k: v for k, v in found.items() if v} == {}
     # the checker must catch what it claims to
