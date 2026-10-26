@@ -159,8 +159,9 @@ def predictions_from_batch(payload, *, include_supplementary=False):
 
 
 def predictions_from_baselines(payloads):
-    """One prediction per (query, candidate product); the product of a file is its ``candidate_product_id``."""
-    """A repeat of (query, product) inside one file follows the single rule of ``evaluate_multi`` (identical = ignored and
+    """One prediction per (query, candidate product); the product of a file is its ``candidate_product_id``.
+
+    A repeat of (query, product) inside one file follows the single rule of ``evaluate_multi`` (identical = ignored and
     counted, different = conflict); the same pair in two different files is ``duplicate_candidate_product``."""
     predictions, owner = [], {}
     for number, payload in enumerate(payloads):

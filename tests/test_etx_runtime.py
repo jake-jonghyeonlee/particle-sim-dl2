@@ -32,7 +32,8 @@ SRC = ROOT / 'src'
 # commit message. Tasks that touch other modules (search, index, train, ...) leave it alone.
 # T3 (dl2-db/T3) moved it from efc6dac to 36ff7dc because it adds the multi-product mode to eval_position.py.
 # T6 (dl2-db/T6) moved it to e0402d0 (its base commit) because it changes eval_position.py again (T3 review adv:2, adv:8).
-D10_BASELINE_COMMIT = 'e0402d07f59bc1281a61579bee2e6153265fd803'
+# T8 (dl2-db/T8) moved it to 71da345 (its base commit) because it merges two docstring literals of eval_position.py (T6 review adv:9).
+D10_BASELINE_COMMIT = '71da345d786f12fa6735bbec344cc224c6049cec'
 D10_CHANGED_SINCE_BASELINE = ('psdl2/eval_position.py',)
 # The real D10 guarantee is separate: the baseline_ncc bundle of this commit writes the same output bytes as the bundle of
 # this older commit for the existing single-search / single-baseline flow. It never moves.
