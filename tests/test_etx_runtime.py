@@ -26,10 +26,16 @@ import test_position_baseline as tp
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / 'src'
-# D10: the committed ETX baseline_ncc bundle must carry the baseline_ncc import closure of this commit byte for byte.
+# D10: the committed ETX baseline_ncc bundle must carry the baseline_ncc import closure of this commit byte for byte,
+# except the modules listed in D10_CHANGED_SINCE_BASELINE, which must equal the working tree instead.
 # A Task that changes a closure module on purpose moves this constant to that Task's base commit and says why in the
 # commit message. Tasks that touch other modules (search, index, train, ...) leave it alone.
-D10_BASELINE_COMMIT = 'efc6dac346c6e0fefb373cb850946ff377adb627'
+# T3 (dl2-db/T3) moved it from efc6dac to 36ff7dc because it adds the multi-product mode to eval_position.py.
+D10_BASELINE_COMMIT = '36ff7dc35c8bc8a8599a85ae4af5b15f537cb00a'
+D10_CHANGED_SINCE_BASELINE = ('psdl2/eval_position.py',)
+# The real D10 guarantee is separate: the baseline_ncc bundle of this commit writes the same output bytes as the bundle of
+# this older commit for the existing single-search / single-baseline flow. It never moves.
+D10_OUTPUT_COMMIT = 'efc6dac346c6e0fefb373cb850946ff377adb627'
 DEFAULT_ETX_PY = Path('~/.cache/psdl2-etx/venv39-notorch/bin/python').expanduser()
 DEFAULT_PY38 = Path('~/.local/share/uv/python/cpython-3.8.20-macos-aarch64-none/bin/python3').expanduser()
 WORKSPACE = '작업 폴더 공백 ñ'
@@ -496,9 +502,13 @@ def test_smoke_bundle_passes_on_the_etx_torch_python(torch_py, tmp_path):
     assert 'Traceback' not in proc.err
     log = read_log(base, SMOKE_LOG)
     assert 'python 3.9.' in log and 'numpy 1.23.5' in log and 'PIL 10.1.0' in log and 'torch 2.1.1' in log and 'cuda available:' in log
-    for step in ('patches', 'make_split', 'train', 'index', 'search'):
+    assert re.search(r'setuptools (\d|unavailable)', log) and 'cuda check failed' not in log
+    for step in ('patches', 'make_split', 'train', 'index', 'search', 'eval_position'):
         assert f' start {step} ' in log and f' {step} exit 0 in ' in log
-    assert log.count(' start patches ') == 8 and 'smoke check OK' in log
+    assert log.count(' start patches ') == 8 and 'smoke check OK' in log and 'eval check OK' in log
+    evaluation = json.loads((base / 'psdl2_smoke/out/eval_position.json').read_text(encoding='utf-8'))
+    assert evaluation['schema_version'] == 'psdl2_eval_position_multi_v1' and evaluation['summary']['n_queries_with_truth'] == 3
+    assert evaluation['arguments']['mode'] == 'search_batch' and evaluation['status'] == 'available'
     batch = json.loads((base / 'psdl2_smoke/out/search_batch.json').read_text(encoding='utf-8'))
     assert batch['schema_version'] == 'psdl2_search_batch_v1' and len(batch['results']) == 3
     for ranking in batch['rankings']:
@@ -509,6 +519,23 @@ def test_smoke_bundle_passes_on_the_etx_torch_python(torch_py, tmp_path):
     again = execute(torch_py, script, tmp_path)
     assert again.returncode == 0, again.err
     assert json.loads((base / 'psdl2_smoke/out/search_batch.json').read_text(encoding='utf-8'))['rankings'] == batch['rankings']
+
+
+def test_version_line_has_setuptools_and_a_failed_cuda_check_keeps_torch_usable(etx_py, tmp_path, workspace):
+    script = make_bundle(tmp_path, [('search', ['--help'], None)], workspace)
+    assert 'for optional in ("PIL", "setuptools", "torch"):' in script.read_text(encoding='utf-8')
+    digest = re.search(r'PAYLOAD_SHA256 = "([0-9a-f]{64})"', script.read_text(encoding='utf-8')).group(1)
+    package_root = script.parent / f'.psdl2_pkg_{digest[:12]}'  # the runner puts this folder first on sys.path
+    package_root.mkdir()
+    (package_root / 'torch.py').write_text(
+        '__version__ = "9.9"\n\n\nclass cuda:\n    @staticmethod\n    def is_available():\n        raise RuntimeError("no driver")\n',
+        encoding='utf-8')
+    proc = execute(etx_py, script, tmp_path)
+    assert proc.returncode == 0, proc.err
+    log = read_log(workspace)
+    assert re.search(r'setuptools (\d|unavailable)', log) and 'torch 9.9' in log
+    assert 'cuda check failed: RuntimeError' in log and 'cuda available' not in log
+    assert 'ERROR' not in log and ' search exit 0 ' in log  # the job still ran: torch counts as usable
 
 
 def test_smoke_bundle_stops_at_the_first_torch_job_without_torch(etx_py, tmp_path):
@@ -538,10 +565,10 @@ def test_smoke_bundle_build_is_deterministic_and_its_views_match_psdl2(tmp_path)
 
 # ---------------------------------------------------------------- bundle equals the efc6dac bundle (D10)
 
-def git_show(path):
-    proc = subprocess.run(['git', 'show', f'{D10_BASELINE_COMMIT}:{path}'], capture_output=True, cwd=ROOT)
+def git_show(path, commit):
+    proc = subprocess.run(['git', 'show', f'{commit}:{path}'], capture_output=True, cwd=ROOT)
     if proc.returncode != 0:
-        message = f'commit {D10_BASELINE_COMMIT[:7]} is not reachable from this checkout (git show failed)'
+        message = f'commit {commit[:7]} is not reachable from this checkout (git show failed)'
         if os.environ.get('PSDL2_ALLOW_MISSING_ETX_PY') == '1':
             pytest.skip(message)
         pytest.fail(message + '. Fetch the history, or set PSDL2_ALLOW_MISSING_ETX_PY=1 to skip on purpose.', pytrace=False)
@@ -580,23 +607,29 @@ COMMITTED = ROOT / 'bundles/etx/psdl2_job_baseline_ncc.py'
 SMOKE = ROOT / 'bundles/etx/psdl2_job_smoke_torch.py'
 
 
-def test_regenerated_bundle_payload_is_the_efc6dac_source():
+def test_regenerated_bundle_payload_is_the_baseline_commit_source():
     files = payload_files(COMMITTED.read_text(encoding='utf-8'))
     closure = import_closure(files)
     assert {'psdl2/baseline_ncc.py', 'psdl2/data.py', 'psdl2/eval_position.py', 'psdl2/schema.py'} <= closure
     # search, index and the torch modules are outside the closure, so a Task that only changes them keeps the constant
     assert not closure & {'psdl2/search.py', 'psdl2/index.py', 'psdl2/train.py', 'psdl2/model.py'}
+    assert set(D10_CHANGED_SINCE_BASELINE) <= closure
     for name in sorted(closure):
-        assert files[name] == git_show(f'src/{name}'), f'{name} differs from {D10_BASELINE_COMMIT[:7]}'
+        if name in D10_CHANGED_SINCE_BASELINE:
+            assert files[name] == (SRC / name).read_bytes(), f'{name} differs from the working tree'
+            assert files[name] != git_show(f'src/{name}', D10_BASELINE_COMMIT), f'{name} is unchanged: drop it from the list'
+        else:
+            assert files[name] == git_show(f'src/{name}', D10_BASELINE_COMMIT), f'{name} differs from {D10_BASELINE_COMMIT[:7]}'
 
 
 def test_regenerated_bundle_keeps_the_edit_block_and_jobs():
-    old = git_show('bundles/etx/psdl2_job_baseline_ncc.py').decode('utf-8')
+    old = git_show('bundles/etx/psdl2_job_baseline_ncc.py', D10_OUTPUT_COMMIT).decode('utf-8')
     new = COMMITTED.read_text(encoding='utf-8')
     assert 'JOBS = [' in edit_section(new) and edit_section(new) == edit_section(old)
 
 
 def test_regenerated_bundle_output_is_byte_identical_to_efc6dac_bundle(etx_py, tmp_path):
+    assert D10_OUTPUT_COMMIT.startswith('efc6dac')
     """No run-specific field (time, path) appears in the JSON or sheet, so nothing is excluded; the new done markers are
     the only extra files and are not part of the comparison."""
     trees = {}
@@ -606,7 +639,8 @@ def test_regenerated_bundle_output_is_byte_identical_to_efc6dac_bundle(etx_py, t
         base = make_workspace(sub / WORKSPACE)
         script = sub / 'upload dir/job.py'
         script.parent.mkdir()
-        text = git_show('bundles/etx/psdl2_job_baseline_ncc.py').decode('utf-8') if label == 'old' else COMMITTED.read_text(encoding='utf-8')
+        text = (git_show('bundles/etx/psdl2_job_baseline_ncc.py', D10_OUTPUT_COMMIT).decode('utf-8') if label == 'old'
+                else COMMITTED.read_text(encoding='utf-8'))
         script.write_text(text.replace('BASE_DIR = None', f'BASE_DIR = {str(base)!r}', 1), encoding='utf-8')
         proc = execute(etx_py, script, sub)
         assert proc.returncode == 0, proc.err

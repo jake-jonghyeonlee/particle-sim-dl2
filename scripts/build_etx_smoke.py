@@ -2,7 +2,7 @@
 """ETX(Linux 서버)용 torch smoke 실행기를 bundles/etx/psdl2_job_smoke_torch.py로 만든다.
 
 실행기 하나만 올려 실행하면 합성 fixture(3제품 + 음성 제품 1개)를 BASE_DIR/psdl2_smoke 아래에 스스로 만들고
-patches -> make_split -> train(1 epoch) -> index -> search --all-ready --exclude-query-product 를 차례로 돈다.
+patches -> make_split -> train(1 epoch) -> index -> search --all-ready --exclude-query-product -> eval_position --search-batch 를 차례로 돈다.
 외부 데이터가 필요 없다. 로그에서 단계별 시작·종료 코드와 python/numpy/Pillow/torch/cuda 판을 본다."""
 from __future__ import annotations
 
@@ -56,6 +56,8 @@ def _jobs():
                             "--checkpoint", _p("out", "model.pt"), "--index", _p("out", "index.json"),
                             "--cohort", _p("cohort.json"), "--topk", "4", "--per-product-topk", "2",
                             "--out", _p("out", "search_batch.json"), "--device", DEVICE]))
+    jobs.append(("eval_position", ["--search-batch", _p("out", "search_batch.json"), "--correspondence", _p("correspondence.json"),
+                                   "--hit-tolerance-um", "2", "--k", "4", "--out", _p("out", "eval_position.json")]))
     return jobs
 
 
@@ -97,14 +99,22 @@ def _derivation(removed):
                        "processed_endpoint": "B", "removed_layers": list(removed)}]}
 
 
-def _bars(shape):
+def _bars(shape, product):
+    """제품마다 영상이 조금 다르다(P0..P2 는 막대 옆 점의 위치가 다르고, 음성 제품 N 은 막대가 가로로 누워 있다).
+    그래서 동점이 없고, N 은 mask_derivation 검사를 꺼도 1위가 되지 못한다."""
     import numpy as np
     l0 = np.zeros(shape, np.uint8)
     l1 = np.zeros(shape, np.uint8)
     cnt = np.zeros(shape, np.uint8)
-    l0[6:24, 10:12] = 1
-    l1[6:24, 14:16] = 1
-    cnt[6:24, 12:14] = 1
+    if product == NEGATIVE:
+        l0[10:12, 6:24] = 1
+        l1[14:16, 6:24] = 1
+        cnt[12:14, 6:24] = 1
+    else:
+        mark = PRODUCTS.index(product)
+        l0[6:24, 10 - mark:12] = 1    # 첫 막대의 굵기가 제품마다 다르다(index 의 후보 수도 제품마다 조금 달라질 수 있다)
+        l1[6:24, 14:16 + mark] = 1
+        cnt[6:24, 12:14] = 1
     return [l0, l1, cnt, np.ones(shape, np.uint8)]
 
 
@@ -125,7 +135,7 @@ def _write_export(root, product):
     for layout, endpoint in zip(row["source_assets"]["layouts"], row["endpoints"]):
         layout["endpoint"] = dict(endpoint)
     refs = [layout["asset"] for layout in row["source_assets"]["layouts"]] + [row["source_assets"]["cnt"], row["source_assets"]["valid"]]
-    for channel, (ref, array) in enumerate(zip(refs, _bars(shape))):
+    for channel, (ref, array) in enumerate(zip(refs, _bars(shape, product))):
         path = folder / "assets" / f"{rid}_{channel}.npy"
         path.parent.mkdir(parents=True, exist_ok=True)
         np.save(str(path), array)
@@ -139,6 +149,22 @@ def _write_export(root, product):
 
 def _dump(path, value):
     path.write_text(json.dumps(value), encoding="utf-8")
+
+
+def _correspondence():
+    """합성 정답(roi_correspondence_v1): 질의 Pi_case0 의 정답 위치는 다음 제품의 중심이다. 평가 단계가 끝까지 도는지만 본다."""
+    centre = [100.0 + 15.5 * 0.5, 200.0 + 15.5 * 0.5]
+    pairs = []
+    for index, product in enumerate(PRODUCTS):
+        other = PRODUCTS[(index + 1) % len(PRODUCTS)]
+        pairs.append({"pair_id": f"S{index}",
+                      "a": {"product_id": product, "design_version": "DESIGN", "frame_id": f"frame_{product}_case0",
+                            "center_xy_um": centre, "analysis_layer": "M3", "roi_id": f"{product}_case0"},
+                      "b": {"product_id": other, "design_version": "DESIGN", "frame_id": f"frame_{other}_case0",
+                            "center_xy_um": centre, "analysis_layer": "M3"},
+                      "source": {"kind": "manual", "labelled_by": "smoke", "labelled_at": "2026-10-26"},
+                      "status": "ready", "reasons": []})
+    return {"schema_version": "roi_correspondence_v1", "producer": {"kind": "manual", "version": "1"}, "pairs": pairs}
 
 
 def _prepare(base):
@@ -173,6 +199,10 @@ def _prepare(base):
     _dump(root / "lineages.json", {"P0": "line_train", "P1": "line_validation", "P2": "line_test", NEGATIVE: "line_negative"})
     _dump(root / "assign.json", {"line_train": "train", "line_validation": "validation", "line_test": "test", "line_negative": "train"})
     _dump(root / "cohort.json", list(order))
+    _dump(root / "correspondence.json", _correspondence())
+    for stale in (root / "out" / "eval_position.json", root / "out" / ("eval_position.json" + DONE_SUFFIX)):
+        if stale.exists():   # 다시 실행하면 평가 산출물과 완료 표지를 새로 만든다(search 결과가 바이트 단위로 같다는 보장이 없다)
+            stale.unlink()
     _smoke_log(f"fixture ready: {len(order)} products ({', '.join(order)}); negative product {NEGATIVE}")
 
 
@@ -199,17 +229,24 @@ def _check(base):
         products = {row["product_id"] for row in ranking["candidates"]}
         if query_product in products or NEGATIVE in products:
             bad(f"query {ranking['query_roi_id']} got candidates of {sorted(products)}")
+    evaluation = Path(base) / SMOKE_DIR / "out" / "eval_position.json"
+    if not evaluation.is_file():
+        bad("the eval_position output is missing")
+    summary = json.loads(evaluation.read_text(encoding="utf-8"))
+    if summary.get("schema_version") != "psdl2_eval_position_multi_v1" or summary["summary"]["n_queries_with_truth"] != len(PRODUCTS):
+        bad("the eval_position output has the wrong schema or query count")
+    _smoke_log(f"eval check OK: {summary['summary']['n_hit_at_k']} of {len(PRODUCTS)} queries hit within the top 4")
     _smoke_log("smoke check OK: " + ", ".join(f"{r['query_roi_id']} -> {len(r['candidates'])} candidates" for r in rankings))
 '''
 
 HEADER = [
     "DL2 torch smoke: 합성 fixture(3제품 + 음성 제품 1)를 BASE_DIR/psdl2_smoke 에 만들고 patches -> make_split -> train(1 epoch)",
-    "-> index -> search --all-ready --exclude-query-product 를 돈다. 외부 데이터가 필요 없다. torch 가 있는 Python 으로 실행한다.",
+    "-> index -> search --all-ready --exclude-query-product -> eval_position --search-batch 를 돈다. 외부 데이터가 필요 없다. torch 가 있는 Python 으로 실행한다.",
     "BASE_DIR 은 쓸 수 있는 폴더의 절대 경로로 적는다. DEVICE 를 \"cuda\" 로 바꾸면 train·index·search 가 GPU 로 돈다(CUDA torch 필요).",
     "끝나면 로그(LOG_FILE)를 그대로 돌려준다. 다시 실행하면 같은 폴더를 덮어쓴다.",
 ]
 DOCSTRING = ("psdl2(DL2) torch smoke 단일 파일 실행기 (자동 생성: scripts/build_etx_smoke.py). 소스 해시 @@SHA@@.\n"
-             "합성 fixture 로 patches -> make_split -> train -> index -> search 를 한 번에 돌려 torch 환경을 확인한다.")
+             "합성 fixture 로 patches -> make_split -> train -> index -> search -> eval_position 을 한 번에 돌려 torch 환경을 확인한다.")
 
 
 def _hooks():

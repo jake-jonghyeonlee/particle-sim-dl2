@@ -221,14 +221,16 @@ PY=.venv-gpu/Scripts/python.exe
 ```
 
 - EDIT 블록: `DEVICE`(기본 `"cpu"`, `"cuda"`로 바꾸면 `train`·`index`·`search`가 GPU로 돈다), `BASE_DIR`(쓸 수 있는 폴더의 절대 경로), `WORK_DIR`, `LOG_FILE`.
-- 실행하면 합성 fixture(호환 제품 3개 `P0`~`P2` + 음성 제품 `N`)를 `BASE_DIR/psdl2_smoke/` 아래에 만든다. 음성 제품은 `mask_derivation`이 달라 어떤 질의와도 호환되지 않으며 `rejected`로만 나온다. 이어서 `patches`(random·grid) → `make_split` → `train`(1 epoch) → `index` → `search --all-ready --exclude-query-product --per-product-topk 2`를 돌리고, 끝에서 결과를 확인한다(질의마다 후보가 있고, 질의 제품과 음성 제품 후보가 없다). 실패하면 `smoke_check_failed`로 멈춘다.
+- 실행하면 합성 fixture(호환 제품 3개 `P0`~`P2` + 음성 제품 `N`)를 `BASE_DIR/psdl2_smoke/` 아래에 만든다. 음성 제품은 `mask_derivation`이 달라 어떤 질의와도 호환되지 않으며 `rejected`로만 나온다. 이어서 `patches`(random·grid) → `make_split` → `train`(1 epoch) → `index` → `search --all-ready --exclude-query-product --per-product-topk 2` → `eval_position --search-batch`(합성 `roi_correspondence_v1`: 질의 `Pi_case0`의 정답은 다음 제품의 중심)를 돌리고, 끝에서 결과를 확인한다(질의마다 후보가 있고, 질의 제품과 음성 제품 후보가 없고, 평가 출력이 `psdl2_eval_position_multi_v1`이며 정답 질의가 3개다). 합성 정답은 평가 단계가 끝까지 도는지만 본다. hit 수는 확인하지 않는다. 제품마다 영상이 조금 다르다(`P0`~`P2`는 첫 막대의 굵기, `N`은 막대가 가로로 누워 있다). 다시 실행하면 평가 출력과 완료 표지를 지우고 새로 만든다. 실패하면 `smoke_check_failed`로 멈춘다. 실행기 맨 위 버전 줄에는 python·numpy·PIL·setuptools·torch 판이 나오고, CUDA 확인이 실패하면 `cuda check failed: <예외 형식>`만 남기고 torch는 쓸 수 있는 것으로 본다.
 - 다시 실행하면 같은 폴더를 같은 바이트로 덮어쓴다(`patches`·`make_split`은 `--overwrite`).
 - 각 단계의 시작·종료 코드와 python·numpy·Pillow·torch·`cuda available:` 판이 로그에 남는다. torch가 없으면 numpy만 쓰는 `patches` 8개가 돈 뒤 첫 torch 작업(`make_split`)에서 `torch_required_for_make_split`로 종료 코드 2다.
 - 이 번들은 `train`·`index`·`search`·`make_split` 작업이라 완료 표지를 쓰지 않는다.
 
 #### D10 기준 commit 갱신 절차
 
-ETX `baseline_ncc` 번들의 `baseline_ncc` import 폐포(`baseline_ncc.py`, `data.py`, `eval_position.py`, `schema.py` 등)는 기준 commit의 소스와 바이트까지 같아야 한다. 기준 commit은 `tests/test_etx_runtime.py`의 상수 `D10_BASELINE_COMMIT`(현재 `efc6dac`) 하나다. 폐포 모듈을 **일부러** 바꾸는 Task는 이 상수를 그 Task의 기준 commit으로 옮기고, 이유를 commit 메시지에 쓴다. `search`·`index`·`train` 등 폐포 밖 모듈만 바꾸는 Task는 이 상수를 그대로 둔다(폐포에 `search`가 없음을 시험이 확인한다).
+ETX `baseline_ncc` 번들의 `baseline_ncc` import 폐포(`baseline_ncc.py`, `data.py`, `eval_position.py`, `schema.py` 등)는 기준 commit의 소스와 바이트까지 같아야 한다. 기준 commit은 `tests/test_etx_runtime.py`의 상수 `D10_BASELINE_COMMIT`(현재 `36ff7dc`)이다. 폐포 모듈을 **일부러** 바꾸는 Task는 이 상수를 그 Task의 기준 commit으로 옮기고, 이유를 commit 메시지에 쓴다. 바꾼 모듈은 `D10_CHANGED_SINCE_BASELINE`에 적는다(현재 `psdl2/eval_position.py`: 번들 안의 바이트가 작업 폴더의 소스와 같아야 하고, 기준 commit과는 달라야 한다). `search`·`index`·`train` 등 폐포 밖 모듈만 바꾸는 Task는 이 상수를 그대로 둔다(폐포에 `search`가 없음을 시험이 확인한다).
+
+D10의 실제 보장은 따로 있다. "`efc6dac` 번들과 현재 번들이 기존 흐름(`baseline_ncc` 두 방향 → 단일 `--baseline` 평가)에서 같은 바이트의 출력을 낸다"는 시험이고, 기준은 옮기지 않는 상수 `D10_OUTPUT_COMMIT`(`efc6dac`)이다. 단일 `--search`·`--baseline` 평가가 `efc6dac`의 `eval_position.py`와 바이트까지 같다는 시험(`tests/test_eval_multi.py`, `EVAL_GOLDEN_COMMIT`)과 단일 검색 출력이 `efc6dac`의 `search.py`와 같다는 시험(`tests/test_search_batch.py`, `SEARCH_GOLDEN_COMMIT`)도 이 commit에 묶여 있다.
 
 #### 로컬에서 ETX 환경 재현
 
@@ -451,6 +453,12 @@ DL1이 고른 비교군 제품 id 목록이다. 검색의 주 결과는 이 제�
 #    hit = 반환 후보 중심이 같은 제품·frame의 정답 중심에서 --hit-tolerance-um 안에 있을 때
 .venv/bin/python -m psdl2.eval_position --search runs/dl2_search_1.json runs/dl2_search_2.json \
   --correspondence pairs_ids.json --hit-tolerance-um 5 --k 10 --out runs/eval_dl2.json
+# 8b) 배치 봉투(psdl2.search --all-ready)를 질의 단위로 평가한다. 출력 schema 는 5.4.2 의 psdl2_eval_position_multi_v1
+.venv/bin/python -m psdl2.eval_position --search-batch runs/dl2_search_batch.json \
+  --correspondence pairs_ids.json --hit-tolerance-um 5 --k 10 --out runs/eval_dl2_batch.json   # --include-supplementary 는 supplementary 후보도 센다
+# 8c) 제품마다 baseline_ncc 결과 파일 하나씩(2개 이상이면 같은 schema 의 다중 모드). 파일 1개는 기존 8) 방식 그대로다
+.venv/bin/python -m psdl2.eval_position --baseline runs/ncc_B.json runs/ncc_C.json \
+  --correspondence pairs_ids.json --hit-tolerance-um 5 --k 10 --out runs/eval_ncc_multi.json
 
 # 9) 비DL 기준선: 같은 role/layer layout 합집합에 대한 ZNCC template matching (학습 없음)
 .venv/bin/python -m psdl2.baseline_ncc --query-export query/review_rois.json --index-export candidates/review_rois.json \
@@ -649,7 +657,7 @@ ready 행과 blocked 행의 수, blocked 사유, producer 정보가 JSON으로 �
   "arguments": {"topk": 4, "expand": false, "per_product_topk": 2, "exclude_query_product": true,
                 "ignore_mask_derivation": false, "cohort": ["P0", "P1", "P2"]},
   "results": [],
-  "rankings": [{"query_roi_id": "P0_case0", "query_product_id": "P0",
+  "rankings": [{"query_roi_id": "P0_case0", "query_product_id": "P0", "query_export_sha256": "<64 hex>",
                 "candidates": [{"rank": 1, "roi_id": "patch_…", "product_id": "P1", "frame_id": "frame_P1_case0",
                                 "center_xy_um": [106.0, 204.0], "search_scope": "primary"}]}]
 }
@@ -657,13 +665,55 @@ ready 행과 blocked 행의 수, blocked 사유, producer 정보가 JSON으로 �
 
 | 필드 | 뜻 |
 |---|---|
-| `index_sources` | 색인이 단일 export로 만들어졌으면(색인에 `sources`가 없다) 문자열 `"single_export"`. dataset으로 만들었으면 source마다 `export_sha256`, `patch_set_sha256s`, `product_ids`. `product_ids`는 그 source의 patch set에서 나온 색인 레코드의 제품이다. 색인 레코드는 source가 아니라 patch set 해시로만 이어지므로, patch set이 없는 source는 `[]`다 |
+| `index_sources` | 색인이 단일 export로 만들어졌으면(색인에 `sources`가 없다) 문자열 `"single_export"`. dataset으로 만들었으면 source마다 `export_sha256`, `patch_set_sha256s`, `product_ids`. `product_ids`는 그 source의 patch set에서 나온 색인 레코드의 제품이다. 색인 레코드는 source가 아니라 patch set 해시로만 이어진다. patch set이 없는 source가 **하나뿐**이면 patch 출처가 없는 레코드의 제품을 그 source의 것으로 본다. 그런 source가 둘 이상이면 서로 구분할 수 없으므로 `null`(알 수 없음)이다. `[]`는 "이 source에서 나온 레코드가 없다"는 뜻이다 |
 | `inputs` | `query_export_sha256`: `export` 인자 파일의 sha256(`--query-dataset`이면 `null`). `query_dataset_sha256`: manifest 파일의 sha256(`export` 인자면 `null`). `index_sha256`: `--index` 파일의 sha256 |
 | `arguments` | 이 실행의 `topk`, `expand`, `per_product_topk`(없으면 `null`), `exclude_query_product`, `ignore_mask_derivation`, 정렬된 `cohort` |
 | `results[i]` | 같은 인수로 `--roi-id <그 질의>`를 돌린 단일 출력과 같다(canonical JSON: 키 정렬, 같은 float 표기). 순서는 `roi_id` 사전순이고 아무것도 덧붙이지 않는다 |
-| `rankings[i]` | `results[i]`에서 하나의 유도 함수(`derive_rankings`)로 만든다. `rank`는 1부터, primary 순서 다음 supplementary 순서. `frame_id`는 행의 `frame.frame_id` 그대로 |
+| `rankings[i]` | `results[i]`에서 하나의 유도 함수(`derive_rankings`)로 만든다. `rank`는 1부터, primary 순서 다음 supplementary 순서. `frame_id`는 행의 `frame.frame_id` 그대로. `query_export_sha256`은 그 질의 ROI가 속한 source export 파일의 sha256이다(dataset은 source마다 다르다. `export` 인자면 그 파일의 sha256). `inputs.query_export_sha256`은 그대로이고 `results`는 건드리지 않는다 |
 
-한 번에 `--out` 하나를 같은 폴더 임시 파일 + `os.replace`로 쓴다. 중단되면 옛 파일이 남는다. 질의 하나가 계약 오류면 종료 코드 2이고 파일을 쓰지 않는다.
+한 번에 `--out` 하나를 같은 폴더 임시 파일 + `os.replace`로 쓴다. 중단되면 옛 파일이 남는다. 질의 하나가 계약 오류면 종료 코드 2이고 파일을 쓰지 않는다. 배치 중의 오류는 표준 오류에 `{"error": "…", "roi_id": "<그 질의>"}`로 나온다(건너뛰지 않는다). `--roi-id` 단일 질의의 오류는 `{"error": "…"}`뿐이다.
+
+**봉투 크기 추정.** 질의 Q개, 색인 레코드 M개, 질의당 `--topk`가 T(`--expand`이면 supplementary 행도 T까지 더해진다)일 때 `indent=2`로 쓴 바이트는 대략 `Q × (8.5 KB + 0.15 KB × M + 9.8 KB × T)`다. `results[i]`가 행마다 embedding을 뺀 레코드 전체(약 7 KB)를 담고, 질의 레코드(약 6.7 KB)와 `rejected`·`index_roi_ids`(레코드당 약 0.13 KB)도 담기 때문이다. 합성 실측 1점: Q=3, M=19, T=4(`--exclude-query-product`)에서 153,194 B(질의당 약 51 KB). T=1, 2, 4, 8에서 64,719, 94,221, 153,194, 271,182 B로 T에 선형이다. 실제 데이터의 레코드 크기는 다르므로 이 상수를 외삽하지 말고, 작은 실행의 파일 크기로 다시 잰다.
+
+#### 5.4.2 위치 평가 `psdl2_eval_position_multi_v1` (`psdl2.eval_position --search-batch` 또는 `--baseline` 2개 이상)
+
+단위는 질의다. 정답은 `roi_correspondence_v1`의 질의별 (정답 제품, frame, 위치) 목록이고, 정답이 있는 질의가 분모다(제품 가중 없음).
+
+- `--search-batch`: 질의 하나의 `rankings[i].candidates` 전체가 한 prediction이다. 기본은 `search_scope == "primary"` 후보만 센다. `--include-supplementary`를 줘야 supplementary 후보도 포함하고, 출력 `arguments.include_supplementary`에 기록한다.
+- `--baseline` 파일 2개 이상: 파일마다 후보 제품이 하나(`candidate_product_id`)다. prediction 키는 `(질의, 후보 제품)`이다. 같은 키가 두 파일에 있으면 `duplicate_candidate_product`로 종료 코드 2다. 같은 질의가 제품 B 파일과 제품 C 파일에 서로 다른 후보로 있는 것은 충돌이 아니다.
+- hit: 같은 제품·frame의 정답 중심에서 `--hit-tolerance-um` 이내이고 prediction의 앞 `--k`개 안에 있다(기존 `psdl2_position_eval_v1`과 같은 판정). 점수는 제품 사이에서 비교하거나 재순위하지 않는다.
+- 질의는 정답 제품마다 그 제품을 덮는 prediction으로 판정한다(배치는 질의의 랭킹 전체, 다중 baseline은 그 제품 파일의 prediction). 정답 제품이 여럿이면 하나라도 hit면 질의 hit다.
+- `--search-batch`, `--search`, `--baseline`은 서로 배타다. `--baseline` 파일이 하나면 기존 모드(`psdl2_position_eval_v1`)다. `--include-supplementary`는 `--search-batch`와만 쓴다.
+
+```json
+{
+  "schema_version": "psdl2_eval_position_multi_v1",
+  "arguments": {"mode": "search_batch", "search_batch": "runs/dl2_search_batch.json", "include_supplementary": false,
+                "correspondence": "pairs_ids.json", "hit_tolerance_um": 5.0, "k": 10},
+  "hit_tolerance_um": 5.0, "k": 10, "status": "available", "reasons": [],
+  "summary": {"n_queries_with_truth": 4, "n_queries_with_prediction": 4, "n_queries_without_prediction": 0,
+              "n_prediction_queries_without_truth": 0, "n_duplicate_predictions_ignored": 0, "n_top1_hit": 1, "n_hit_at_k": 2,
+              "top1_hit_rate": 0.25, "hit_rate_at_10": 0.5, "top1_hit_rate_among_predicted": 0.25, "hit_rate_at_10_among_predicted": 0.5,
+              "mean_top1_distance_um": 1.2, "median_top1_distance_um": 1.1, "baseline_missing_for_truth_product": []},
+  "per_product": {"B": {"n_queries_with_truth": 3, "n_queries_with_prediction": 3, "n_top1_hit": 1, "n_hit_at_k": 2,
+                        "top1_hit_rate": 0.333, "hit_rate_at_10": 0.667}},
+  "queries": [{"query_roi_id": "qb1", "truth_products": ["B"], "status": "available", "reasons": [], "top1_hit": true,
+               "first_hit_rank": 1, "hit_at_k": true, "top1_distance_um": 0.1,
+               "by_product": {"B": {"status": "available", "reasons": [], "n_candidates": 1, "candidates": []}}}],
+  "interpretation": "position_recovery_within_tolerance_not_similarity_quality_or_risk"
+}
+```
+
+| 필드 | 뜻 |
+|---|---|
+| `summary.n_queries_with_truth` | 주 분모. 정답이 있는 질의 수 |
+| `summary.n_queries_with_prediction` | 정답이 있고 후보가 하나라도 있는 질의 수. `…_among_predicted` 비율의 분모이며 기존 모드의 `n_evaluable`과 같은 정의다 |
+| `summary.baseline_missing_for_truth_product` | 정답 제품인데 baseline 파일이 없는 제품. 그 질의는 miss이고 분모에 남는다 |
+| `queries[].reasons` | `<제품>:no_prediction`(그 제품의 prediction 없음), `<제품>:no_candidates`, `<제품>:baseline_missing_for_truth_product` |
+| `per_product[P]` | 정답 제품이 P인 질의의 분모와 hit. 질의가 정답 제품 두 개를 가지면 두 제품의 분모에 모두 들어간다 |
+| `status` | 계산할 질의(`n_queries_with_prediction`)가 없으면 `unavailable`, 종료 코드 3. 이유는 `no_evaluable_queries` 또는 `no_queries_with_truth` |
+
+`--out`은 같은 폴더 임시 파일 + `os.replace`로 쓴다(기존 모드는 예전 방식 그대로). 종료 코드는 0(available) / 3(계산할 질의 없음) / 2(계약 오류)다.
 
 후보로 삼는 조건은 불량 유형, 관여 전극의 역할·layer 조합, CNT/VIA 유무가 같은 것이다. 전극 이름과 순서는 보지 않는다. 결과가 없다는 것은 위험이 0이라는 뜻이 아니다.
 

@@ -206,12 +206,15 @@ def search(query, index, cohort, *, topk, expand=False, ignore_mask_derivation=F
     return result
 
 
-def derive_rankings(results):
-    """The only place rankings are built: primary order first, then supplementary order, ranks from 1."""
+def derive_rankings(results, query_export_sha256s=None):
+    """The only place rankings are built: primary order first, then supplementary order, ranks from 1.
+    ``query_export_sha256s`` gives, per result, the sha256 of the export the query ROI belongs to (None when unknown)."""
     rankings = []
-    for result in results:
+    hashes = query_export_sha256s if query_export_sha256s is not None else [None] * len(results)
+    for result, export_sha256 in zip(results, hashes):
         rows = list(result['primary']) + list(result['supplementary'])
         rankings.append({'query_roi_id': result['query']['roi_id'], 'query_product_id': result['query']['product_id'],
+                         'query_export_sha256': export_sha256,
                          'candidates': [{'rank': rank, 'roi_id': row['roi_id'], 'product_id': row['product_id'],
                                          'frame_id': row['frame']['frame_id'], 'center_xy_um': row['center_xy_um'],
                                          'search_scope': row['search_scope']}
@@ -222,22 +225,55 @@ def derive_rankings(results):
 def index_sources(index):
     """Per-source provenance of the index. A single-export index has no `sources`, so it reports the string
     'single_export'. A dataset index reports each source's export hash and patch-set hashes; `product_ids` lists the
-    products of index records generated from those patch sets (a source without patch sets cannot be linked to its
-    records, so its list is empty)."""
+    products of index records generated from those patch sets. A source without patch sets cannot be linked to its
+    records: when it is the only such source it gets the products of the records without patch provenance, otherwise
+    its `product_ids` is null (unknown)."""
     sources = index.get('sources')
     if sources is None:
         return SINGLE_EXPORT_SOURCES
-    products = {}
+    products, unlinked_products = {}, set()
     for record in index['records']:
         digest = record.get('provenance', {}).get('patch', {}).get('set_sha256')
         if digest is not None:
             products.setdefault(digest, set()).add(record['product_id'])
+        else:
+            unlinked_products.add(record['product_id'])
+    n_unlinked = sum(1 for source in sources if not source.get('patch_sets'))
     result = []
     for source in sources:
         digests = [entry['sha256'] for entry in source.get('patch_sets', [])]
-        result.append({'export_sha256': source['export_sha256'], 'patch_set_sha256s': digests,
-                       'product_ids': sorted(set().union(*(products.get(d, set()) for d in digests)))})
+        if digests:
+            product_ids = sorted(set().union(*(products.get(d, set()) for d in digests)))
+        else:
+            product_ids = sorted(unlinked_products) if n_unlinked == 1 else None
+        result.append({'export_sha256': source['export_sha256'], 'patch_set_sha256s': digests, 'product_ids': product_ids})
     return result
+
+
+def query_export_sha256s(imported, rois, manifest_path=None, export_path=None):
+    """The export sha256 of each query ROI. A single export hashes the file itself; a dataset maps every ROI to its
+    source (patch rows through their patch-set hash, other rows through the roi ids of the source's export file)."""
+    if manifest_path is None:
+        digest = _sha256_file(export_path)
+        return [digest] * len(rois)
+    by_set, by_roi = {}, {}
+    base = Path(manifest_path).parent
+    for source in imported.sources:
+        entries = source.get('patch_sets', [])
+        for entry in entries:
+            by_set[entry['sha256']] = source['export_sha256']
+        if not entries:
+            location = Path(source['export'])
+            document = json.loads((location if location.is_absolute() else base / location).read_text(encoding='utf-8'))
+            for row in document['rois']:
+                by_roi[row['roi_id']] = source['export_sha256']
+    hashes = []
+    for roi in rois:
+        digest = by_set.get(roi.patch['set_sha256']) if roi.patch is not None else by_roi.get(roi.row['roi_id'])
+        if digest is None:
+            raise ContractError('query_export_unknown')
+        hashes.append(digest)
+    return hashes
 
 
 def _sha256_file(path):
@@ -275,6 +311,7 @@ def main(argv=None):
     parser.add_argument('--max-asset-memory-mb', type=float, help='Reject the export if retained decoded masks would exceed this (transient decode buffers are extra)')
     parser.add_argument('--device', choices=('cpu', 'cuda'), default='cpu')
     args = parser.parse_args(argv)
+    current_roi = None  # the query being searched in a batch; named in the error so a failed batch can be traced
     try:
         if (args.roi_id is None) == (not args.all_ready):
             raise ContractError('exactly_one_of_roi_id_or_all_ready_required')
@@ -320,10 +357,12 @@ def main(argv=None):
             options['index_validated'] = True
         results = []
         for roi in rois:
+            current_roi = roi.row['roi_id'] if args.all_ready else None
             bundle = views.bundle(roi)
             with torch.no_grad():
                 query = candidate_record(bundle, model([bundle])['embedding'][0].cpu().tolist(), roi.mask_derivation)
             results.append(search(query, index, cohort, **options))
+        current_roi = None
         if not args.all_ready:
             result = results[0]
             _write_atomic(args.out, json.dumps(result, allow_nan=False, indent=2))
@@ -338,14 +377,18 @@ def main(argv=None):
                     'arguments': {'topk': args.topk, 'expand': bool(args.expand), 'per_product_topk': args.per_product_topk,
                                   'exclude_query_product': bool(args.exclude_query_product),
                                   'ignore_mask_derivation': bool(args.ignore_mask_derivation), 'cohort': sorted(cohort)},
-                    'results': results, 'rankings': derive_rankings(results)}
+                    'results': results,
+                    'rankings': derive_rankings(results, query_export_sha256s(imported, rois, args.query_dataset, args.export))}
         _write_atomic(args.out, json.dumps(envelope, allow_nan=False, indent=2))
         n_available = sum(1 for r in results if r['status'] == 'available')
         print(json.dumps({'status': 'available' if n_available == len(results) else 'partial', 'n_queries': len(results),
                           'n_available': n_available, 'n_unavailable': len(results) - n_available}))
         return 0 if n_available == len(results) else 3
     except (ContractError, KeyError, ValueError, TypeError, OSError) as exc:
-        print(json.dumps({'error': str(exc)}), file=sys.stderr); return 2
+        error = {'error': str(exc)}
+        if current_roi is not None:
+            error['roi_id'] = current_roi
+        print(json.dumps(error), file=sys.stderr); return 2
 
 
 if __name__ == '__main__':

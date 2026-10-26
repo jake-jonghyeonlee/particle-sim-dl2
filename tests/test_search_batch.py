@@ -20,9 +20,14 @@ from psdl2.search import derive_rankings, index_sources, main as search_main, se
 from test_etx_runtime import build_smoke_bundle, execute, git_show
 from test_search import fixed_records, make_index
 
+# The single-query outputs must stay byte-identical to this commit's search.py. It never moves with the D10 constant.
+SEARCH_GOLDEN_COMMIT = 'efc6dac346c6e0fefb373cb850946ff377adb627'
 PRODUCTS = ('P0', 'P1', 'P2')
 QUERIES = [f'{p}_case0' for p in PRODUCTS]
-GRID_PER_PRODUCT = 5
+
+def grid_count(index, product):
+    """Index records of one product. The products' images differ a little (adv:3), so their grid sizes may differ too."""
+    return sum(1 for r in index['records'] if r['product_id'] == product)
 
 
 def canonical(value):
@@ -71,7 +76,7 @@ def efc6dac_search_main():
     """The efc6dac search.py, executed as a module of the same package (its relative imports resolve to the current psdl2)."""
     module = types.ModuleType('psdl2._search_efc6dac')
     module.__package__ = 'psdl2'
-    exec(compile(git_show('src/psdl2/search.py').decode('utf-8'), 'search_efc6dac.py', 'exec'), module.__dict__)
+    exec(compile(git_show('src/psdl2/search.py', SEARCH_GOLDEN_COMMIT).decode('utf-8'), 'search_efc6dac.py', 'exec'), module.__dict__)
     return module.main
 
 
@@ -112,7 +117,7 @@ def test_exclude_query_product_leaves_no_query_product_candidate(world, capsys, 
         assert rows and product not in {r['product_id'] for r in rows}
         assert result['excluded_products'] == [product] and 'per_product_topk' not in result
         excluded = [r for r in result['rejected'] if r['reason'] == 'query_product_excluded']
-        assert len(excluded) == GRID_PER_PRODUCT
+        assert len(excluded) == grid_count(world.index, product) > 0
         assert {r['roi_id'] for r in excluded} == {r['roi_id'] for r in world.index['records'] if r['product_id'] == product}
         # the negative product is rejected as incompatible, never ranked
         assert 'N' not in {r['product_id'] for r in rows}
@@ -132,8 +137,12 @@ def test_per_product_topk_then_topk_gives_distinct_products(world, capsys):
     wide, _ = single(world, capsys, 'P0_case0', '--exclude-query-product', topk=100)
     best = {}
     for row in wide['primary']:
-        best.setdefault(row['product_id'], row)
-    assert result['primary'] == sorted(best.values(), key=lambda r: (-r['score'], r['roi_id']))[:2]  # scores are untouched
+        best[row['product_id']] = max(best.get(row['product_id'], -2), row['score'])
+    # which products survive and which row stands for each does not rest on a tie: two products remain, each keeps one row
+    # whose score is its product's maximum, and scores are untouched
+    assert sorted(best) == ['P1', 'P2'] and {r['product_id'] for r in result['primary']} == {'P1', 'P2'}
+    assert all(r['score'] == best[r['product_id']] for r in result['primary'])
+    assert [r['score'] for r in result['primary']] == sorted((r['score'] for r in result['primary']), reverse=True)
 
 
 def test_unavailable_when_the_only_cohort_product_is_the_query_product(world, capsys, tmp_path):
@@ -161,8 +170,9 @@ def test_batch_results_equal_single_outputs_and_rankings_are_rederived(world, ca
     for roi, result in zip(QUERIES, envelope['results']):
         one, _ = single(world, capsys, roi, *BATCH_FLAGS)
         assert canonical(result) == canonical(one)
-    assert derive_rankings(envelope['results']) == envelope['rankings']
+    assert derive_rankings(envelope['results'], [r['query_export_sha256'] for r in envelope['rankings']]) == envelope['rankings']
     for ranking, result in zip(envelope['rankings'], envelope['results']):
+        assert list(ranking) == ['query_roi_id', 'query_product_id', 'query_export_sha256', 'candidates']
         rows = result['primary'] + result['supplementary']
         assert [c['rank'] for c in ranking['candidates']] == list(range(1, len(rows) + 1))
         assert [c['roi_id'] for c in ranking['candidates']] == [r['roi_id'] for r in rows]
@@ -221,6 +231,76 @@ def test_batch_with_an_export_and_a_single_export_index(world, capsys, tmp_path)
     assert envelope['inputs'] == {'query_export_sha256': hashlib.sha256(p1.read_bytes()).hexdigest(), 'query_dataset_sha256': None,
                                   'index_sha256': hashlib.sha256(index.read_bytes()).hexdigest()}
     assert [r['query']['roi_id'] for r in envelope['results']] == ['P1_case0'] and envelope['rankings'][0]['candidates'][0]['product_id'] == 'P0'
+    assert [r['query_export_sha256'] for r in envelope['rankings']] == [hashlib.sha256(p1.read_bytes()).hexdigest()]
+
+
+def test_each_ranking_names_the_export_of_its_own_query(world, capsys):
+    """adv:1: a dataset has several query sources, so the hash belongs to the ranking, not to `inputs`."""
+    code, envelope, _, err, _ = batch(world, capsys, 'hashes.json')
+    assert code == 0, err
+    expected = [hashlib.sha256((world.root / 'templates' / p / 'review_rois.json').read_bytes()).hexdigest() for p in PRODUCTS]
+    assert [r['query_roi_id'] for r in envelope['rankings']] == QUERIES
+    assert [r['query_export_sha256'] for r in envelope['rankings']] == expected and len(set(expected)) == 3
+    assert envelope['inputs']['query_export_sha256'] is None  # unchanged: a dataset has no single export
+    assert all('query_export_sha256' not in r['query'] for r in envelope['results'])  # results are untouched
+
+
+def test_index_sources_product_ids_are_null_when_unknown():
+    """adv:2: [] would claim 'this source produced no records'; null says 'cannot be told'."""
+    def index(sources, records):
+        return {'sources': sources, 'records': [{'product_id': p, **({'provenance': {'patch': {'set_sha256': d}}} if d else {})}
+                                                for p, d in records]}
+    patched = {'export_sha256': 'e1', 'patch_sets': [{'sha256': 'a' * 64}]}
+    plain = {'export_sha256': 'e2'}
+    # one source without patch sets: the records without patch provenance are its records
+    one = index([patched, plain], [('X', 'a' * 64), ('Y', None), ('Z', None)])
+    assert [s['product_ids'] for s in index_sources(one)] == [['X'], ['Y', 'Z']]
+    assert index_sources(one)[1] == {'export_sha256': 'e2', 'patch_set_sha256s': [], 'product_ids': ['Y', 'Z']}
+    # two sources without patch sets: they cannot be told apart
+    two = index([patched, plain, {'export_sha256': 'e3'}], [('X', 'a' * 64), ('Y', None)])
+    assert [s['product_ids'] for s in index_sources(two)] == [['X'], None, None]
+    # a source whose patch set produced no record is known to have none
+    empty = index([patched, plain], [('Y', None)])
+    assert [s['product_ids'] for s in index_sources(empty)] == [[], ['Y']]
+    assert index_sources({'records': []}) == 'single_export'
+
+
+def test_negative_product_never_wins_even_with_the_mask_derivation_check_off(world, capsys):
+    """adv:3: the negative product has a different image, so ignoring its mask_derivation does not make it a tie."""
+    for roi in QUERIES:
+        result, _ = single(world, capsys, roi, '--ignore-mask-derivation', topk=100)
+        negative = [r for r in result['primary'] if r['product_id'] == 'N']
+        assert result['mask_derivation_comparison'] == 'ignored'
+        assert len(negative) == grid_count(world.index, 'N') > 0 and all(r['score'] < 1.0 for r in negative)
+    # A query that is an exact copy of an indexed P0 record scores 1.0 against it; N (another image) stays below 1.0, so N
+    # cannot take first place. (With identical images N would also score 1.0 and tie.)
+    original = next(r for r in world.index['records'] if r['product_id'] == 'P0')
+    query = deepcopy(original)
+    query['roi_id'] = 'copy_of_' + original['roi_id']
+    result = search(query, world.index, {'P0', 'P1', 'P2', 'N'}, topk=100, ignore_mask_derivation=True)
+    scores = {r['roi_id']: r['score'] for r in result['primary']}
+    assert scores[original['roi_id']] == 1.0 and result['primary'][0]['score'] == 1.0 and result['primary'][0]['product_id'] != 'N'
+    assert max(r['score'] for r in result['primary'] if r['product_id'] == 'N') < 1.0
+
+
+def test_a_contract_error_in_a_batch_names_the_query(world, capsys, monkeypatch):
+    """adv:4: the batch stops at the first failing query (no skipping) and says which one."""
+    real = search_module.search
+
+    def failing(query, *a, **kw):
+        if query['roi_id'] == 'P1_case0':
+            raise ContractError('simulated_query_failure')
+        return real(query, *a, **kw)
+
+    monkeypatch.setattr(search_module, 'search', failing)
+    out = world.out / 'named_error.json'
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text('OLD')
+    code, stdout, err = call(search_main, capsys, *args(world), '--all-ready', '--out', out)
+    assert code == 2 and stdout == '' and json.loads(err) == {'error': 'simulated_query_failure', 'roi_id': 'P1_case0'}
+    assert out.read_text() == 'OLD'
+    code, stdout, err = call(search_main, capsys, *args(world), '--roi-id', 'P1_case0', '--out', out)
+    assert code == 2 and json.loads(err) == {'error': 'simulated_query_failure'}  # a single query keeps the old message
 
 
 @pytest.mark.parametrize('extra,error', [
@@ -293,7 +373,7 @@ def test_search_function_exclusion_and_per_product_limits(source):
 def test_index_size_on_the_synthetic_world(world):
     path = world.root / 'out/index.json'
     records = len(world.index['records'])
-    assert records == 4 * GRID_PER_PRODUCT
+    assert records == sum(grid_count(world.index, p) for p in (*PRODUCTS, 'N')) and records >= 4
     size = path.stat().st_size
     assert size > 0 and os.path.getsize(path) / records > 0
     print(f'index: {records} records, {size} bytes, {size / records:.0f} bytes per record')

@@ -294,16 +294,20 @@ def run_jobs(jobs):
     stamp = lambda: time.strftime("%Y-%m-%d %H:%M:%S")
     import numpy
     versions = [f"python {sys.version.split()[0]}", f"numpy {numpy.__version__}"]
-    for optional in ("PIL", "torch"):
+    for optional in ("PIL", "setuptools", "torch"):
         try:
             module = importlib.import_module(optional)
             versions.append(f"{optional} {module.__version__}")
-            if optional == "torch":
-                versions.append(f"cuda available: {bool(module.cuda.is_available())}")
         except Exception as exc:  # 로그용 정보일 뿐이다. torch 예외는 작업 전 검사가 다시 import 하지 않고 쓴다.
             versions.append(f"{optional} unavailable ({type(exc).__name__})")
             if optional == "torch" and not (isinstance(exc, ModuleNotFoundError) and exc.name == "torch"):
                 TORCH_IMPORT["error"] = (type(exc).__name__, str(exc))
+            continue
+        if optional == "torch":
+            try:  # CUDA 확인이 실패해도 torch 를 쓸 수 있다는 판정은 그대로다
+                versions.append(f"cuda available: {bool(module.cuda.is_available())}")
+            except Exception as exc:
+                versions.append(f"cuda check failed: {type(exc).__name__}")
     print(f"[psdl2_job] {stamp()} {' | '.join(versions)} | psdl2 from {psdl2.__file__}", file=sys.stderr, flush=True)
     _prepare(Path.cwd())
     for name, args in jobs:
