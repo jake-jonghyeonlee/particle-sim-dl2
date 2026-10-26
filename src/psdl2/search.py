@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import argparse
 from copy import deepcopy
+import hashlib
 import json
+import os
 from pathlib import Path
 import sys
 
@@ -119,8 +121,17 @@ def endpoint_key_for_identity(ep):
     return (ep['electrode_id'], ep['role'], ep['actual_layer'])
 
 
-def search(query, index, cohort, *, topk, expand=False, ignore_mask_derivation=False):
-    validate_record(query); validate_index(index)
+BATCH_SCHEMA = 'psdl2_search_batch_v1'
+SINGLE_EXPORT_SOURCES = 'single_export'
+
+
+def search(query, index, cohort, *, topk, expand=False, ignore_mask_derivation=False,
+           exclude_query_product=False, per_product_topk=None, index_validated=False):
+    validate_record(query)
+    if not index_validated:
+        validate_index(index)
+    if per_product_topk is not None and (type(per_product_topk) is not int or per_product_topk < 1):
+        raise ContractError('positive_per_product_topk_required')
     if not isinstance(cohort, (set, list, tuple)) or not cohort:
         raise ContractError('explicit_DL1_product_cohort_required')
     cohort = {text(v) for v in cohort}
@@ -135,6 +146,8 @@ def search(query, index, cohort, *, topk, expand=False, ignore_mask_derivation=F
             continue
         if candidate['roi_id'] == query['roi_id'] and candidate['source_identity'] == query['source_identity']:
             rejected.append({'roi_id': candidate['roi_id'], 'reason': 'query_itself_excluded'}); continue
+        if exclude_query_product and candidate['product_id'] == query['product_id']:
+            rejected.append({'roi_id': candidate['roi_id'], 'reason': 'query_product_excluded'}); continue
         if compatibility_signature(candidate['case_signature']) != compatibility_signature(query['case_signature']):
             rejected.append({'roi_id': candidate['roi_id'], 'reason': 'case_or_CNT_binding_incompatible'}); continue
         if not ignore_mask_derivation:
@@ -159,10 +172,20 @@ def search(query, index, cohort, *, topk, expand=False, ignore_mask_derivation=F
         (primary if in_primary else supplementary).append(result)
     for rows in (primary, supplementary):
         rows.sort(key=lambda row: (-row['score'], row['roi_id']))
+    if per_product_topk is not None:
+        # Applied after the ordering and before --topk; scores are not adjusted.
+        for name, rows in (('primary', primary), ('supplementary', supplementary)):
+            seen_count, kept = {}, []
+            for row in rows:
+                seen_count[row['product_id']] = seen_count.get(row['product_id'], 0) + 1
+                if seen_count[row['product_id']] <= per_product_topk:
+                    kept.append(row)
+            rows[:] = kept
     if primary:
         status, reasons = 'available', []
     else:
-        cohort_records = [r for r in index['records'] if r['product_id'] in cohort]
+        cohort_records = [r for r in index['records'] if r['product_id'] in cohort
+                          and not (exclude_query_product and r['product_id'] == query['product_id'])]
         status = 'unavailable'
         reasons = ['no_candidates_in_primary_cohort' if not cohort_records else 'no_case_compatible_primary_candidates']
         others = {r['roi_id'] for r in cohort_records if not (r['roi_id'] == query['roi_id'] and r['source_identity'] == query['source_identity'])}
@@ -176,7 +199,60 @@ def search(query, index, cohort, *, topk, expand=False, ignore_mask_derivation=F
             'interpretation': 'similarity_only_not_registration_cause_or_risk'}
     if ignore_mask_derivation:
         result['mask_derivation_comparison'] = 'ignored'
+    if exclude_query_product:
+        result['excluded_products'] = [query['product_id']]
+    if per_product_topk is not None:
+        result['per_product_topk'] = per_product_topk
     return result
+
+
+def derive_rankings(results):
+    """The only place rankings are built: primary order first, then supplementary order, ranks from 1."""
+    rankings = []
+    for result in results:
+        rows = list(result['primary']) + list(result['supplementary'])
+        rankings.append({'query_roi_id': result['query']['roi_id'], 'query_product_id': result['query']['product_id'],
+                         'candidates': [{'rank': rank, 'roi_id': row['roi_id'], 'product_id': row['product_id'],
+                                         'frame_id': row['frame']['frame_id'], 'center_xy_um': row['center_xy_um'],
+                                         'search_scope': row['search_scope']}
+                                        for rank, row in enumerate(rows, 1)]})
+    return rankings
+
+
+def index_sources(index):
+    """Per-source provenance of the index. A single-export index has no `sources`, so it reports the string
+    'single_export'. A dataset index reports each source's export hash and patch-set hashes; `product_ids` lists the
+    products of index records generated from those patch sets (a source without patch sets cannot be linked to its
+    records, so its list is empty)."""
+    sources = index.get('sources')
+    if sources is None:
+        return SINGLE_EXPORT_SOURCES
+    products = {}
+    for record in index['records']:
+        digest = record.get('provenance', {}).get('patch', {}).get('set_sha256')
+        if digest is not None:
+            products.setdefault(digest, set()).add(record['product_id'])
+    result = []
+    for source in sources:
+        digests = [entry['sha256'] for entry in source.get('patch_sets', [])]
+        result.append({'export_sha256': source['export_sha256'], 'patch_set_sha256s': digests,
+                       'product_ids': sorted(set().union(*(products.get(d, set()) for d in digests)))})
+    return result
+
+
+def _sha256_file(path):
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def _write_atomic(path, text):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_name(path.name + '.tmp%d' % os.getpid())
+    try:
+        temp.write_text(text)
+        os.replace(str(temp), str(path))
+    finally:
+        if temp.exists():
+            temp.unlink()
 
 
 def main(argv=None):
@@ -185,7 +261,13 @@ def main(argv=None):
     parser.add_argument('--query-dataset', type=Path, help='psdl2_dataset_v1 manifest wrapping the query export (and its mask_derivation)')
     parser.add_argument('--ignore-mask-derivation', action='store_true',
                         help='skip the mask_derivation compatibility check; the result records that it was skipped')
-    parser.add_argument('--roi-id', required=True); parser.add_argument('--checkpoint', required=True, type=Path)
+    parser.add_argument('--roi-id'); parser.add_argument('--checkpoint', required=True, type=Path)
+    parser.add_argument('--all-ready', action='store_true',
+                        help='search every ready query ROI (sorted by roi_id) and write one psdl2_search_batch_v1 envelope')
+    parser.add_argument('--exclude-query-product', action='store_true',
+                        help='drop candidates whose product_id equals the query product_id (primary and supplementary)')
+    parser.add_argument('--per-product-topk', type=int,
+                        help='keep at most M rows per product (after ordering, before --topk) in primary and supplementary')
     parser.add_argument('--index', required=True, type=Path); parser.add_argument('--cohort', required=True, type=Path)
     parser.add_argument('--topk', required=True, type=int); parser.add_argument('--expand', action='store_true')
     parser.add_argument('--out', required=True, type=Path)
@@ -194,6 +276,10 @@ def main(argv=None):
     parser.add_argument('--device', choices=('cpu', 'cuda'), default='cpu')
     args = parser.parse_args(argv)
     try:
+        if (args.roi_id is None) == (not args.all_ready):
+            raise ContractError('exactly_one_of_roi_id_or_all_ready_required')
+        if args.per_product_topk is not None and args.per_product_topk < 1:
+            raise ContractError('positive_per_product_topk_required')
         import torch
         from .checkpoint import fingerprint
         from .model import resolve_device
@@ -213,23 +299,51 @@ def main(argv=None):
             imported = load_export(args.export, assets_root=args.assets_root,
                                    allow_unversioned_producer=args.allow_unversioned_producer,
                                    max_asset_memory_mb=args.max_asset_memory_mb)
-        rois = [r for r in imported.ready if r.row['roi_id'] == args.roi_id]
-        if len(rois) != 1:
-            raise ContractError('one_ready_query_roi_required')
+        if args.all_ready:
+            rois = sorted(imported.ready, key=lambda r: r.row['roi_id'])
+            if not rois:
+                raise ContractError('ready_query_roi_required')
+        else:
+            rois = [r for r in imported.ready if r.row['roi_id'] == args.roi_id]
+            if len(rois) != 1:
+                raise ContractError('one_ready_query_roi_required')
         if args.query_dataset is None:
             model, views, fp = load_encoder(args.checkpoint, args.device)
         index = json.loads(args.index.read_text())
         if index['checkpoint_fingerprint'] != fp or index['view_fingerprint'] != fingerprint(view_config_dict(views)):
             raise ContractError('incompatible_index_checkpoint_or_transform')
-        bundle = views.bundle(rois[0])
-        with torch.no_grad():
-            query = candidate_record(bundle, model([bundle])['embedding'][0].cpu().tolist(), rois[0].mask_derivation)
-        result = search(query, index, read_cohort(args.cohort), topk=args.topk, expand=args.expand,
-                        ignore_mask_derivation=args.ignore_mask_derivation)
-        args.out.parent.mkdir(parents=True, exist_ok=True); args.out.write_text(json.dumps(result, allow_nan=False, indent=2))
-        print(json.dumps({'status': result['status'], 'primary': len(result['primary']), 'supplementary': len(result['supplementary']),
-                          'no_match_reasons': result['no_match_reasons']}))
-        return 0 if result['status'] == 'available' else 3
+        cohort = read_cohort(args.cohort)
+        options = dict(topk=args.topk, expand=args.expand, ignore_mask_derivation=args.ignore_mask_derivation,
+                       exclude_query_product=args.exclude_query_product, per_product_topk=args.per_product_topk)
+        if args.all_ready:
+            validate_index(index)  # once, not per query
+            options['index_validated'] = True
+        results = []
+        for roi in rois:
+            bundle = views.bundle(roi)
+            with torch.no_grad():
+                query = candidate_record(bundle, model([bundle])['embedding'][0].cpu().tolist(), roi.mask_derivation)
+            results.append(search(query, index, cohort, **options))
+        if not args.all_ready:
+            result = results[0]
+            _write_atomic(args.out, json.dumps(result, allow_nan=False, indent=2))
+            print(json.dumps({'status': result['status'], 'primary': len(result['primary']), 'supplementary': len(result['supplementary']),
+                              'no_match_reasons': result['no_match_reasons']}))
+            return 0 if result['status'] == 'available' else 3
+        envelope = {'schema_version': BATCH_SCHEMA, 'checkpoint_fingerprint': index['checkpoint_fingerprint'],
+                    'view_fingerprint': index['view_fingerprint'], 'index_sources': index_sources(index),
+                    'inputs': {'query_export_sha256': _sha256_file(args.export) if args.export is not None else None,
+                               'query_dataset_sha256': _sha256_file(args.query_dataset) if args.query_dataset is not None else None,
+                               'index_sha256': _sha256_file(args.index)},
+                    'arguments': {'topk': args.topk, 'expand': bool(args.expand), 'per_product_topk': args.per_product_topk,
+                                  'exclude_query_product': bool(args.exclude_query_product),
+                                  'ignore_mask_derivation': bool(args.ignore_mask_derivation), 'cohort': sorted(cohort)},
+                    'results': results, 'rankings': derive_rankings(results)}
+        _write_atomic(args.out, json.dumps(envelope, allow_nan=False, indent=2))
+        n_available = sum(1 for r in results if r['status'] == 'available')
+        print(json.dumps({'status': 'available' if n_available == len(results) else 'partial', 'n_queries': len(results),
+                          'n_available': n_available, 'n_unavailable': len(results) - n_available}))
+        return 0 if n_available == len(results) else 3
     except (ContractError, KeyError, ValueError, TypeError, OSError) as exc:
         print(json.dumps({'error': str(exc)}), file=sys.stderr); return 2
 

@@ -189,39 +189,61 @@ PY=.venv-gpu/Scripts/python.exe
 | `base_dir_missing` | `BASE_DIR`가 가리키는 폴더가 없다 | 존재하는 폴더의 절대 경로로 고친다. 이 오류는 로그 파일을 열기 전이라 콘솔에만 나온다 |
 | `log_file_unwritable` | `LOG_FILE`을 `BASE_DIR` 아래에 쓸 수 없다(폴더 자리에 파일이 있거나 권한이 없음) | 쓸 수 있는 경로로 고치거나 `None`으로 둔다 |
 | `torch_required_for_<모듈>` | 그 작업(`train`, `index`, `search`, `evaluate`, `make_split`)에 torch가 필요한데 이 Python에 없다 | torch가 있는 Python으로 실행하거나 `JOBS`에서 그 작업을 뺀다. 앞 작업의 산출물은 남아 있다 |
-| `torch_import_failed` | torch 파일은 있으나 import가 실패한다(설치 손상, CUDA 라이브러리 등) | 메시지의 원인을 보고 torch 설치를 고친다. 앞 작업의 산출물은 남아 있다 |
+| `torch_import_failed` | torch 파일은 있으나 import가 실패한다(설치 손상, CUDA 라이브러리 등). 메시지는 `torch_import_failed: <예외 형식>: <메시지>`이며 버전 줄을 만들 때 낸 첫 예외를 그대로 쓴다(다시 import하지 않는다) | 메시지의 원인을 보고 torch 설치를 고친다. 앞 작업의 산출물은 남아 있다 |
+| `out_must_be_file_path` | 표지를 쓰는 작업의 `--out`이 `/`(또는 `\`)로 끝난다 | `--out`에 파일 경로를 적는다. 폴더 경로는 받지 않는다 |
 | `stale_done_marker:output_missing` | 완료 표지에 적힌 산출물이 지금 없다 | 표지(`<out>.psdl2_done.json`)를 지우고 다시 실행한다 |
 | `stale_done_marker:output_modified` | 산출물 내용이 표지에 적힌 sha256과 다르다 | 같음. 산출물을 일부러 고친 것이면 다른 이름으로 보관한다 |
 | `stale_done_marker:inputs_changed` | 입력 파일 내용 또는 작업 인자가 표지 때와 다르다 | 같음 |
 | `stale_done_marker:runner_changed` | 이 실행기의 `psdl2`가 표지를 만든 실행기와 다른 판이다 | 같음 |
-| `stale_done_marker:marker_unreadable` | 표지 파일이 깨졌다 | 같음 |
+| `stale_done_marker:marker_unreadable` | 표지 파일이 깨졌거나(JSON 아님) 필요한 키가 없거나 형식이 다르다 | 같음 |
 | `job_output_missing` | 작업이 종료 코드 0인데 `--out` 산출물이 없다 | 작업 인자의 `--out`을 확인한다. 표지는 쓰지 않는다 |
 
 `baseline_ncc`·`eval_position`·`patches`·`data`는 numpy와 Pillow만 쓴다. `train`·`index`·`evaluate`·`make_split`은 import할 때, `search`는 실행할 때 torch를 쓴다. 이 검사는 각 작업을 시작하기 직전에 한다.
 
 #### 재시작 표지
 
-`--out`이 있는 작업은 성공(종료 코드 0)하면 `<out>.psdl2_done.json`을 쓴다. 내용은 `module`, `runner_payload_sha256`, `argv`, `input_sha256s`(인자에 적힌 기존 입력 파일), `outputs`(`--out`과 `--sheet-dir` 안의 파일 경로·sha256)다. 같은 폴더의 임시 파일을 `os.replace`로 바꾸므로 반쪽 표지가 남지 않는다.
+표지는 `baseline_ncc`와 `eval_position` 작업에만 쓴다(`MARKER_MODULES`). 그 밖의 모듈은 표지를 쓰지도 읽지도 않고 매번 실행하며, 시작할 때 로그에 `no done marker for <모듈> (indirect inputs are not hashed)`를 남긴다. 표지는 **인자에 적힌 파일만** 비교한다. 데이터셋이 가리키는 export, 체크포인트가 읽는 파일 같은 간접 입력은 해시하지 않으므로, 그런 모듈에 표지를 쓰면 입력이 바뀌어도 건너뛰는 오류가 난다.
+
+`--out`이 있는 위 두 작업은 성공(종료 코드 0)하면 `<out>.psdl2_done.json`을 쓴다. 내용은 `module`, `runner_payload_sha256`, `argv`, `input_sha256s`(인자에 적힌 기존 입력 파일), `outputs`(`--out`과 `--sheet-dir` 안의 파일 경로·sha256)다. 같은 폴더의 임시 파일을 `os.replace`로 바꾸므로 반쪽 표지가 남지 않는다.
 
 - 다시 실행하면 표지와 현재 상태(실행기 판·인자·입력·산출물 sha256)가 모두 같을 때 `skip completed <모듈>`을 로그에 남기고 건너뛴다. 1번 작업이 성공하고 2번이 실패했다면 고친 뒤 다시 실행했을 때 2번부터 돈다.
 - 하나라도 다르면 위 표의 `stale_done_marker:<사유>`로 멈춘다. 자동으로 덮어쓰거나 지우지 않는다.
-- 종료 코드 3(부분 결과)은 표지를 쓰지 않는다. `--out`이 없는 작업(`evaluate` 등)도 표지가 없고 매번 실행된다.
+- 종료 코드 3(부분 결과)은 표지를 쓰지 않는다. `--out`이 없는 작업도 표지가 없다.
+- `--out`이 구분자로 끝나면 `out_must_be_file_path`로 거부한다(표지가 폴더 안에 놓이는 것을 막는다).
 - `baseline_ncc`의 `--sheet-dir`는 비어 있어야 하므로, 산출물을 다시 만들려면 표지와 함께 옛 `--out`·시트 폴더를 옮겨 둔다.
+
+#### torch smoke 실행기
+
+`bundles/etx/psdl2_job_smoke_torch.py`(생성기 `scripts/build_etx_smoke.py`)는 ETX에서 torch 경로가 도는지 확인하는 번들 하나다. 외부 데이터가 필요 없다. 올려서 실행하고 로그(`BASE_DIR/psdl2_smoke/smoke.log`)를 돌려준다.
+
+```bash
+.venv/bin/python scripts/build_etx_smoke.py --overwrite   # bundles/etx/psdl2_job_smoke_torch.py
+```
+
+- EDIT 블록: `DEVICE`(기본 `"cpu"`, `"cuda"`로 바꾸면 `train`·`index`·`search`가 GPU로 돈다), `BASE_DIR`(쓸 수 있는 폴더의 절대 경로), `WORK_DIR`, `LOG_FILE`.
+- 실행하면 합성 fixture(호환 제품 3개 `P0`~`P2` + 음성 제품 `N`)를 `BASE_DIR/psdl2_smoke/` 아래에 만든다. 음성 제품은 `mask_derivation`이 달라 어떤 질의와도 호환되지 않으며 `rejected`로만 나온다. 이어서 `patches`(random·grid) → `make_split` → `train`(1 epoch) → `index` → `search --all-ready --exclude-query-product --per-product-topk 2`를 돌리고, 끝에서 결과를 확인한다(질의마다 후보가 있고, 질의 제품과 음성 제품 후보가 없다). 실패하면 `smoke_check_failed`로 멈춘다.
+- 다시 실행하면 같은 폴더를 같은 바이트로 덮어쓴다(`patches`·`make_split`은 `--overwrite`).
+- 각 단계의 시작·종료 코드와 python·numpy·Pillow·torch·`cuda available:` 판이 로그에 남는다. torch가 없으면 numpy만 쓰는 `patches` 8개가 돈 뒤 첫 torch 작업(`make_split`)에서 `torch_required_for_make_split`로 종료 코드 2다.
+- 이 번들은 `train`·`index`·`search`·`make_split` 작업이라 완료 표지를 쓰지 않는다.
+
+#### D10 기준 commit 갱신 절차
+
+ETX `baseline_ncc` 번들의 `baseline_ncc` import 폐포(`baseline_ncc.py`, `data.py`, `eval_position.py`, `schema.py` 등)는 기준 commit의 소스와 바이트까지 같아야 한다. 기준 commit은 `tests/test_etx_runtime.py`의 상수 `D10_BASELINE_COMMIT`(현재 `efc6dac`) 하나다. 폐포 모듈을 **일부러** 바꾸는 Task는 이 상수를 그 Task의 기준 commit으로 옮기고, 이유를 commit 메시지에 쓴다. `search`·`index`·`train` 등 폐포 밖 모듈만 바꾸는 Task는 이 상수를 그대로 둔다(폐포에 `search`가 없음을 시험이 확인한다).
 
 #### 로컬에서 ETX 환경 재현
 
 ETX는 Python 3.9.14, numpy 1.23.5, Pillow 10.1.0, torch 2.1.1이다. 개발 venv(3.12, numpy 2.x)와 다르므로 실행기는 3.9 venv에서도 시험한다.
 
 ```bash
-bash scripts/setup_etx_venvs.sh     # ~/.cache/psdl2-etx/ 에 venv39-notorch, venv39-torch (PyPI 1회 사용)
+bash scripts/setup_etx_venvs.sh     # ~/.cache/psdl2-etx/ 에 venv39-notorch, venv39-torch (네트워크 1회 사용)
 PYTHONPATH=$PWD/src .venv/bin/python -m pytest tests/test_etx_runtime.py
 ```
 
 - `venv39-notorch`: 3.9.14 + numpy 1.23.5 + Pillow 10.1.0. ETX 시험이 이 venv를 쓴다. `PSDL2_ETX_PY`로 다른 인터프리터를 지정한다.
-- `venv39-torch`: 위 + torch 2.1.1(CPU 빌드). `import torch`까지만 확인한다.
+- `venv39-torch`: 위 + torch 2.1.1 + `setuptools<81`(torch 2.1.1이 컴파일 중 `pkg_resources`를 import한다). torch smoke 시험이 이 venv를 쓴다. `PSDL2_ETX_TORCH_PY`로 다른 인터프리터를 지정한다. 여기서 `import torch`가 실패하면 스크립트는 종료 코드 1로 멈춘다. macOS는 PyPI wheel 그대로, Linux는 CPU wheel index(`https://download.pytorch.org/whl/cpu`)를 쓴다. ETX 실제 빌드는 cu121이므로 CUDA는 재현하지 못한다.
 - 스크립트는 설치된 판을 출력한다. 정확히 3.9.14를 못 받으면 가까운 3.9.x로 만들고 그 사실을 출력한다.
 - venv가 없으면 시험은 skip이 아니라 실패한다. 일부러 건너뛸 때만 `PSDL2_ALLOW_MISSING_ETX_PY=1`을 쓴다.
-- 이 시험은 합성 데이터로 `baseline_ncc` 두 방향 → `eval_position` 흐름, 비ASCII·공백 `BASE_DIR`, ASCII 콘솔, 위 오류 코드, 재시작을 확인한다. 실제 ETX(Linux 파일시스템 권한, CUDA, 실데이터 규모)는 확인하지 못한다.
+- 이 시험은 합성 데이터로 `baseline_ncc` 두 방향 → `eval_position` 흐름, 비ASCII·공백 `BASE_DIR`, ASCII 콘솔(`LOG_FILE=None` 포함), 위 오류 코드, 재시작, torch smoke 번들 전체를 확인한다. 실제 ETX(Linux 파일시스템 권한, CUDA, 실데이터 규모)는 확인하지 못한다.
 
 ## 3. 입력
 
@@ -511,6 +533,15 @@ python -m psdl2.search --query-dataset query_dataset.json --roi-id roi_aaa… --
   --index runs/dl2_index.json --cohort cohort.json --topk 50 --out runs/dl2_search.json
 #    [--ignore-mask-derivation] 을 주면 derivation 비교를 생략하고 결과에 "mask_derivation_comparison": "ignored"를 남긴다
 
+# H2) 검색 옵션과 배치. 새 옵션을 주지 않으면 출력은 위와 바이트까지 같다
+#    --exclude-query-product : 질의와 product_id가 같은 후보를 primary·supplementary에서 뺀다(rejected 사유 query_product_excluded)
+#    --per-product-topk M    : 정렬 뒤 제품마다 앞 M개만 남기고 --topk로 자른다(primary·supplementary 각각, 점수 보정 없음)
+#    --all-ready             : --roi-id 대신. 질의 export/dataset의 ready ROI 전부를 roi_id 사전순으로 돌려 봉투 하나로 쓴다
+python -m psdl2.search --query-dataset query_dataset.json --all-ready --exclude-query-product --per-product-topk 2 \
+  --checkpoint runs/dl2.pt --index runs/dl2_index.json --cohort cohort.json --topk 4 --out runs/dl2_search_batch.json
+#    --roi-id 와 --all-ready 는 정확히 하나만 준다(아니면 exactly_one_of_roi_id_or_all_ready_required, 종료 코드 2)
+#    종료 코드: 모든 질의 available → 0, 하나라도 unavailable → 3(ETX 실행기는 계속 진행), 계약 오류 → 2
+
 # I) 위치 평가 (4절 8번과 같다)
 python -m psdl2.eval_position --search runs/dl2_search.json --correspondence pairs_ids.json \
   --hit-tolerance-um 5 --k 50 --out runs/eval_dl2.json
@@ -528,7 +559,7 @@ python -m psdl2.eval_position --baseline runs/baseline.json --correspondence pai
 - **검색 호환.** query와 후보의 `mask_derivation`(규칙 버전, 처리 endpoint, 제거 layer 목록)이 같아야 한다. 다르면 `mask_derivation_mismatch`, 한쪽만 있으면 `mask_derivation_unknown`으로 제외하고 `rejected`에 이유가 남는다. 표는 [training.md](training.md)에 있다.
 - **patch 좌표 조건과 preflight는 다르다.** 생성기는 창 전체가 frame 안인지, core가 전부 valid인지, anchor가 있는지 본다. 학습의 사전 검사(`views.preflight`)는 그것을 보지 않는다.
 - **종료 코드.** patches: 0 정상, 2 오류·부족(종료 코드 3은 쓰지 않는다). make_split: 0 / 2. 그 외는 위 표와 같다.
-- **ETX 실행기.** 2.2의 단일 파일 실행기 작업은 `baseline_ncc`뿐이다. 이 절차의 명령(`patches`, `make_split`, `train --dataset` 등)은 `python -m psdl2.<모듈>`로 돌린다.
+- **ETX 실행기.** 2.2의 `psdl2_job_baseline_ncc.py`가 도는 작업은 `baseline_ncc`·`eval_position`이다. 이 절차 전체는 2.2의 torch smoke 실행기가 합성 데이터로 한 번 돈다. 실데이터는 `python -m psdl2.<모듈>`로 돌린다.
 
 ## 5. 출력
 
@@ -602,6 +633,37 @@ ready 행과 blocked 행의 수, blocked 사유, producer 정보가 JSON으로 �
 | `rejected[]` | 후보에서 뺀 ROI와 사유(예: `case_or_CNT_binding_incompatible`) |
 | `index_roi_ids` | 검색에 쓴 색인의 ROI 전체 목록. 평가에서 정답이 색인에 있었는지 확인하는 데 쓴다 |
 | `interpretation` | 결과를 어떻게 읽어야 하는지에 대한 고정 문구(유사도는 원인·위험 근거가 아님) |
+| `excluded_products` | `--exclude-query-product`를 줄 때만 있다. `[<질의 product_id>]` |
+| `per_product_topk` | `--per-product-topk`를 줄 때만 있다. 준 값 M |
+
+점수는 표시용이다. 수치 계산에 쓰지 않는다. 새 옵션을 주지 않은 단일 질의 출력은 efc6dac의 출력과 바이트까지 같고, 행(`primary`·`supplementary`)의 키 집합은 어떤 옵션에서도 바뀌지 않는다.
+
+#### 5.4.1 배치 봉투 `psdl2_search_batch_v1` (`--all-ready`)
+
+```json
+{
+  "schema_version": "psdl2_search_batch_v1",
+  "checkpoint_fingerprint": "<64 hex>", "view_fingerprint": "<64 hex>",
+  "index_sources": [{"export_sha256": "<64 hex>", "patch_set_sha256s": ["<64 hex>"], "product_ids": ["P0"]}],
+  "inputs": {"query_export_sha256": null, "query_dataset_sha256": "<64 hex>", "index_sha256": "<64 hex>"},
+  "arguments": {"topk": 4, "expand": false, "per_product_topk": 2, "exclude_query_product": true,
+                "ignore_mask_derivation": false, "cohort": ["P0", "P1", "P2"]},
+  "results": [],
+  "rankings": [{"query_roi_id": "P0_case0", "query_product_id": "P0",
+                "candidates": [{"rank": 1, "roi_id": "patch_…", "product_id": "P1", "frame_id": "frame_P1_case0",
+                                "center_xy_um": [106.0, 204.0], "search_scope": "primary"}]}]
+}
+```
+
+| 필드 | 뜻 |
+|---|---|
+| `index_sources` | 색인이 단일 export로 만들어졌으면(색인에 `sources`가 없다) 문자열 `"single_export"`. dataset으로 만들었으면 source마다 `export_sha256`, `patch_set_sha256s`, `product_ids`. `product_ids`는 그 source의 patch set에서 나온 색인 레코드의 제품이다. 색인 레코드는 source가 아니라 patch set 해시로만 이어지므로, patch set이 없는 source는 `[]`다 |
+| `inputs` | `query_export_sha256`: `export` 인자 파일의 sha256(`--query-dataset`이면 `null`). `query_dataset_sha256`: manifest 파일의 sha256(`export` 인자면 `null`). `index_sha256`: `--index` 파일의 sha256 |
+| `arguments` | 이 실행의 `topk`, `expand`, `per_product_topk`(없으면 `null`), `exclude_query_product`, `ignore_mask_derivation`, 정렬된 `cohort` |
+| `results[i]` | 같은 인수로 `--roi-id <그 질의>`를 돌린 단일 출력과 같다(canonical JSON: 키 정렬, 같은 float 표기). 순서는 `roi_id` 사전순이고 아무것도 덧붙이지 않는다 |
+| `rankings[i]` | `results[i]`에서 하나의 유도 함수(`derive_rankings`)로 만든다. `rank`는 1부터, primary 순서 다음 supplementary 순서. `frame_id`는 행의 `frame.frame_id` 그대로 |
+
+한 번에 `--out` 하나를 같은 폴더 임시 파일 + `os.replace`로 쓴다. 중단되면 옛 파일이 남는다. 질의 하나가 계약 오류면 종료 코드 2이고 파일을 쓰지 않는다.
 
 후보로 삼는 조건은 불량 유형, 관여 전극의 역할·layer 조합, CNT/VIA 유무가 같은 것이다. 전극 이름과 순서는 보지 않는다. 결과가 없다는 것은 위험이 0이라는 뜻이 아니다.
 

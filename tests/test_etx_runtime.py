@@ -26,7 +26,10 @@ import test_position_baseline as tp
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / 'src'
-BASELINE_COMMIT = 'efc6dac346c6e0fefb373cb850946ff377adb627'
+# D10: the committed ETX baseline_ncc bundle must carry the baseline_ncc import closure of this commit byte for byte.
+# A Task that changes a closure module on purpose moves this constant to that Task's base commit and says why in the
+# commit message. Tasks that touch other modules (search, index, train, ...) leave it alone.
+D10_BASELINE_COMMIT = 'efc6dac346c6e0fefb373cb850946ff377adb627'
 DEFAULT_ETX_PY = Path('~/.cache/psdl2-etx/venv39-notorch/bin/python').expanduser()
 DEFAULT_PY38 = Path('~/.local/share/uv/python/cpython-3.8.20-macos-aarch64-none/bin/python3').expanduser()
 WORKSPACE = '작업 폴더 공백 ñ'
@@ -239,10 +242,24 @@ def test_ascii_console_with_non_ascii_base_dir_keeps_a_utf8_log(etx_py, tmp_path
         assert proc.returncode == 0, proc.err
         if not isolated:
             proc.stderr.decode('ascii')  # raises if a non-ASCII byte reached the console
+            proc.stdout.decode('ascii')
         assert WORKSPACE in read_log(workspace)
         assert (workspace / 'data/dl2/r2t.json').is_file()
         if not isolated:
             assert 'relative paths resolve from' in proc.err and WORKSPACE not in proc.err
+
+
+def test_ascii_console_without_a_log_file(etx_py, tmp_path, workspace):
+    script = make_bundle(tmp_path, [R2T], workspace)
+    text = script.read_text(encoding='utf-8')
+    script.write_text(re.sub(r'(?m)^LOG_FILE = .*$', 'LOG_FILE = None', text, count=1), encoding='utf-8')
+    proc = execute(etx_py, script, tmp_path, isolated=False, env={'LC_ALL': 'C', 'PYTHONIOENCODING': 'ascii:strict'})
+    assert proc.returncode == 0, proc.err
+    assert 'Traceback' not in proc.err
+    proc.stderr.decode('ascii')
+    proc.stdout.decode('ascii')
+    assert 'relative paths resolve from' in proc.err and WORKSPACE not in proc.err
+    assert (workspace / 'data/dl2/r2t.json').is_file() and not (workspace / 'runs').exists()
 
 
 def test_tee_writes_the_log_first_and_survives_a_strict_ascii_console(tmp_path, workspace):
@@ -302,16 +319,20 @@ def test_torch_required_stops_with_a_code_and_keeps_earlier_outputs(etx_py, tmp_
     assert 'ERROR torch_required_for_' in read_log(workspace)
 
 
-def test_torch_import_failed_is_distinguished(etx_py, tmp_path, workspace):
+def test_torch_import_failed_is_distinguished_and_imports_torch_once(etx_py, tmp_path, workspace):
     script = make_bundle(tmp_path, [('search', ['--help'], None)], workspace)
     digest = re.search(r'PAYLOAD_SHA256 = "([0-9a-f]{64})"', script.read_text(encoding='utf-8')).group(1)
     package_root = script.parent / f'.psdl2_pkg_{digest[:12]}'  # the runner puts this folder first on sys.path
     package_root.mkdir()
-    (package_root / 'torch.py').write_text('raise ImportError("broken torch for the test")\n', encoding='utf-8')
-    proc = execute(etx_py, script, tmp_path)
+    counter = tmp_path / 'torch_imports.txt'
+    (package_root / 'torch.py').write_text(
+        'import os\nopen(os.environ["TORCH_COUNT_FILE"], "a").write("x")\nraise ImportError("broken torch for the test")\n', encoding='utf-8')
+    proc = execute(etx_py, script, tmp_path, env={'TORCH_COUNT_FILE': str(counter)})
     assert proc.returncode == 2
-    assert 'ERROR torch_import_failed:' in proc.err and 'broken torch for the test' in proc.err and 'torch_required_for' not in proc.err
+    # the line carries the exception type and message of the first import, and the check does not import again
+    assert 'ERROR torch_import_failed: ImportError: broken torch for the test.' in proc.err and 'torch_required_for' not in proc.err
     assert 'Traceback' not in proc.err
+    assert counter.read_text() == 'x'
 
 
 @pytest.fixture
@@ -376,12 +397,154 @@ def test_stale_done_marker(etx_py, tmp_path, completed, reason, damage):
     assert log.count(' start ') == starts and 'skip completed' not in log  # nothing was re-run or skipped silently
 
 
+def _truncate(marker):
+    marker.write_text('{"module": "baseline_ncc", "argv": [', encoding='utf-8')
+
+
+def _drop_key(marker):
+    done = json.loads(marker.read_text(encoding='utf-8'))
+    del done['input_sha256s']
+    marker.write_text(json.dumps(done), encoding='utf-8')
+
+
+def _wrong_type(marker):
+    done = json.loads(marker.read_text(encoding='utf-8'))
+    done['outputs'] = 'not a list'
+    marker.write_text(json.dumps(done), encoding='utf-8')
+
+
+def _wrong_entry(marker):
+    done = json.loads(marker.read_text(encoding='utf-8'))
+    done['outputs'] = [{'path': 5}]
+    marker.write_text(json.dumps(done), encoding='utf-8')
+
+
+@pytest.mark.parametrize('damage', [_truncate, _drop_key, _wrong_type, _wrong_entry])
+def test_unreadable_or_misshapen_marker_stops_with_a_code_not_a_traceback(etx_py, tmp_path, completed, damage):
+    script, base = completed
+    damage(base / ('data/dl2/r2t.json' + MARKER))
+    proc = execute(etx_py, script, tmp_path)
+    assert proc.returncode == 2
+    assert 'ERROR stale_done_marker:marker_unreadable:' in proc.err and 'Traceback' not in proc.err
+
+
+def test_zero_exit_without_the_out_file_writes_no_marker(etx_py, tmp_path, workspace):
+    job = ('eval_position', ['--help', '--out', 'data/dl2/never_written.json'], None)  # --help exits 0 before any output
+    script = make_bundle(tmp_path, [job], workspace)
+    proc = execute(etx_py, script, tmp_path)
+    assert proc.returncode == 2
+    assert 'ERROR job_output_missing:' in proc.err and 'Traceback' not in proc.err
+    assert not list((workspace / 'data').rglob('never_written*'))
+
+
+def test_out_ending_with_a_separator_is_rejected(etx_py, tmp_path, workspace):
+    job = ('baseline_ncc', [*R2T[1][:-1], 'data/dl2/folder/'], None)
+    script = make_bundle(tmp_path, [job], workspace)
+    proc = execute(etx_py, script, tmp_path)
+    assert proc.returncode == 2
+    assert 'ERROR out_must_be_file_path:' in proc.err and 'Traceback' not in proc.err and 'start baseline_ncc' not in proc.err
+    assert not (workspace / 'data/dl2').exists()
+
+
+def test_modules_outside_the_whitelist_write_and_read_no_marker_and_say_so(etx_py, tmp_path, workspace):
+    out = workspace / 'data/dl2/patches_help.json'
+    out.parent.mkdir(parents=True)
+    stale = Path(str(out) + MARKER)
+    stale.write_text('this is not JSON and must never be read', encoding='utf-8')
+    script = make_bundle(tmp_path, [('patches', ['--help', '--out', 'data/dl2/patches_help.json'], None)], workspace)
+    for _ in range(2):
+        proc = execute(etx_py, script, tmp_path)
+        assert proc.returncode == 0, proc.err
+    log = read_log(workspace)
+    assert log.count('no done marker for patches (indirect inputs are not hashed)') == 2
+    assert log.count(' start patches ') == 2 and 'skip completed' not in log
+    assert stale.read_text(encoding='utf-8') == 'this is not JSON and must never be read'
+    # the two whitelisted modules still get one
+    assert 'no done marker for baseline_ncc' not in log
+
+
+# ---------------------------------------------------------------- torch smoke bundle (X9)
+
+DEFAULT_TORCH_PY = Path('~/.cache/psdl2-etx/venv39-torch/bin/python').expanduser()
+SMOKE_LOG = 'psdl2_smoke/smoke.log'
+
+
+@pytest.fixture(scope='module')
+def torch_py():
+    return _interpreter('PSDL2_ETX_TORCH_PY', DEFAULT_TORCH_PY, 'Create it with: bash scripts/setup_etx_venvs.sh '
+                        '(set PSDL2_ALLOW_MISSING_ETX_PY=1 only to skip on purpose).')
+
+
+def build_smoke_bundle(tmp_path, base_dir, *, folder='upload dir'):
+    sys.path.insert(0, str(ROOT / 'scripts'))
+    try:
+        from build_etx_smoke import build_smoke
+    finally:
+        sys.path.pop(0)
+    script = tmp_path / folder / 'smoke.py'
+    build_smoke(script)
+    script.write_text(script.read_text(encoding='utf-8').replace('BASE_DIR = None', f'BASE_DIR = {str(base_dir)!r}', 1), encoding='utf-8')
+    return script
+
+
+def test_smoke_bundle_passes_on_the_etx_torch_python(torch_py, tmp_path):
+    base = tmp_path / WORKSPACE
+    base.mkdir()
+    script = build_smoke_bundle(tmp_path, base)
+    proc = execute(torch_py, script, tmp_path)  # `-I`, another cwd, a BASE_DIR with a space and non-ASCII characters
+    assert proc.returncode == 0, proc.err
+    assert 'Traceback' not in proc.err
+    log = read_log(base, SMOKE_LOG)
+    assert 'python 3.9.' in log and 'numpy 1.23.5' in log and 'PIL 10.1.0' in log and 'torch 2.1.1' in log and 'cuda available:' in log
+    for step in ('patches', 'make_split', 'train', 'index', 'search'):
+        assert f' start {step} ' in log and f' {step} exit 0 in ' in log
+    assert log.count(' start patches ') == 8 and 'smoke check OK' in log
+    batch = json.loads((base / 'psdl2_smoke/out/search_batch.json').read_text(encoding='utf-8'))
+    assert batch['schema_version'] == 'psdl2_search_batch_v1' and len(batch['results']) == 3
+    for ranking in batch['rankings']:
+        products = {c['product_id'] for c in ranking['candidates']}
+        assert ranking['candidates'] and ranking['query_product_id'] not in products and 'N' not in products
+    assert not (tmp_path / 'elsewhere/psdl2_smoke').exists()
+    # a second run reuses the same folder and ends the same way
+    again = execute(torch_py, script, tmp_path)
+    assert again.returncode == 0, again.err
+    assert json.loads((base / 'psdl2_smoke/out/search_batch.json').read_text(encoding='utf-8'))['rankings'] == batch['rankings']
+
+
+def test_smoke_bundle_stops_at_the_first_torch_job_without_torch(etx_py, tmp_path):
+    base = tmp_path / WORKSPACE
+    base.mkdir()
+    script = build_smoke_bundle(tmp_path, base)
+    proc = execute(etx_py, script, tmp_path)
+    assert proc.returncode == 2
+    assert 'ERROR torch_required_for_make_split:' in proc.err and 'Traceback' not in proc.err
+    log = read_log(base, SMOKE_LOG)
+    assert log.count(' patches exit 0 ') == 8 and ' start make_split ' not in log  # numpy-only jobs ran, the first torch job did not
+
+
+def test_smoke_bundle_build_is_deterministic_and_its_views_match_psdl2(tmp_path):
+    from dataclasses import asdict
+    sys.path.insert(0, str(ROOT / 'scripts'))
+    try:
+        import build_etx_smoke
+    finally:
+        sys.path.pop(0)
+    out = tmp_path / 'again.py'
+    build_etx_smoke.main(['--out', str(out)])
+    assert out.read_bytes() == SMOKE.read_bytes()
+    from test_views import view_config
+    assert json.loads(json.dumps(asdict(view_config(jitter=(.1, .1))))) == json.loads(json.dumps(build_etx_smoke.VIEWS))
+
+
 # ---------------------------------------------------------------- bundle equals the efc6dac bundle (D10)
 
 def git_show(path):
-    proc = subprocess.run(['git', 'show', f'{BASELINE_COMMIT}:{path}'], capture_output=True, cwd=ROOT)
+    proc = subprocess.run(['git', 'show', f'{D10_BASELINE_COMMIT}:{path}'], capture_output=True, cwd=ROOT)
     if proc.returncode != 0:
-        pytest.skip(f'commit {BASELINE_COMMIT[:7]} is not reachable from this checkout (git show failed)')
+        message = f'commit {D10_BASELINE_COMMIT[:7]} is not reachable from this checkout (git show failed)'
+        if os.environ.get('PSDL2_ALLOW_MISSING_ETX_PY') == '1':
+            pytest.skip(message)
+        pytest.fail(message + '. Fetch the history, or set PSDL2_ALLOW_MISSING_ETX_PY=1 to skip on purpose.', pytrace=False)
     return proc.stdout
 
 
@@ -414,14 +577,17 @@ def edit_section(text):
 
 
 COMMITTED = ROOT / 'bundles/etx/psdl2_job_baseline_ncc.py'
+SMOKE = ROOT / 'bundles/etx/psdl2_job_smoke_torch.py'
 
 
 def test_regenerated_bundle_payload_is_the_efc6dac_source():
     files = payload_files(COMMITTED.read_text(encoding='utf-8'))
     closure = import_closure(files)
     assert {'psdl2/baseline_ncc.py', 'psdl2/data.py', 'psdl2/eval_position.py', 'psdl2/schema.py'} <= closure
+    # search, index and the torch modules are outside the closure, so a Task that only changes them keeps the constant
+    assert not closure & {'psdl2/search.py', 'psdl2/index.py', 'psdl2/train.py', 'psdl2/model.py'}
     for name in sorted(closure):
-        assert files[name] == git_show(f'src/{name}'), f'{name} differs from {BASELINE_COMMIT[:7]}'
+        assert files[name] == git_show(f'src/{name}'), f'{name} differs from {D10_BASELINE_COMMIT[:7]}'
 
 
 def test_regenerated_bundle_keeps_the_edit_block_and_jobs():
@@ -483,11 +649,12 @@ def test_sources_and_bundle_compile_on_python39(etx_py, tmp_path):
         sys.path.pop(0)
     generated = tmp_path / 'generated.py'
     build(generated)
-    _compile_with(etx_py, [*_sources(), generated, COMMITTED, ROOT / 'scripts/build_single_file.py', ROOT / 'scripts/build_etx_runner.py'])
+    _compile_with(etx_py, [*_sources(), generated, COMMITTED, SMOKE, ROOT / 'scripts/build_single_file.py', ROOT / 'scripts/build_etx_runner.py',
+                           ROOT / 'scripts/build_etx_smoke.py'])
 
 
 def test_sources_and_bundle_still_compile_on_python38(py38):
-    _compile_with(py38, [*_sources(), COMMITTED])
+    _compile_with(py38, [*_sources(), COMMITTED, SMOKE])
 
 
 def test_modules_import_on_python39_without_torch(etx_py):
@@ -550,7 +717,8 @@ def python310_findings(path, source):
 
 
 def test_no_python310_syntax_or_api_in_sources_and_bundle():
-    paths = [*_sources(), COMMITTED, ROOT / 'scripts/build_single_file.py', ROOT / 'scripts/build_etx_runner.py']
+    paths = [*_sources(), COMMITTED, SMOKE, ROOT / 'scripts/build_single_file.py', ROOT / 'scripts/build_etx_runner.py',
+             ROOT / 'scripts/build_etx_smoke.py']
     found = {str(p.relative_to(ROOT)): python310_findings(p, p.read_text(encoding='utf-8')) for p in paths}
     assert {k: v for k, v in found.items() if v} == {}
     # the checker must catch what it claims to

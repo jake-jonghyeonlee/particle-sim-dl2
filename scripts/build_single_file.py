@@ -52,6 +52,10 @@ from pathlib import Path
 
 CONTINUE_CODES = (0, 3)
 DONE_SUFFIX = ".psdl2_done.json"
+# 완료 표지는 이 모듈에만 쓴다. 표지는 인자에 적힌 파일만 비교하므로, 간접 입력(예: 데이터셋이 가리키는 export, 체크포인트가
+# 읽는 파일)이 있는 모듈은 표지를 쓰지도 읽지도 않고 매번 실행한다.
+MARKER_MODULES = ("baseline_ncc", "eval_position")
+TORCH_IMPORT = {"error": None}   # 버전 줄을 만들 때 첫 torch import 예외(형식, 메시지)를 저장한다
 # 작업(모듈)별 바깥 의존. 표에 없는 모듈은 numpy·Pillow 만 쓴다(patches, data 포함).
 # 이 표는 src/psdl2 의 실제 import 를 확인해 만든다: train·index·make_split·evaluate 는 import 때, search 는 실행 때 torch 를 쓴다.
 MODULE_NEEDS = {
@@ -107,19 +111,21 @@ def _console_write(stream, text):
 
 
 class _Tee:
-    """로그 파일(UTF-8)에 먼저 쓰고 콘솔에 쓴다."""
+    """로그 파일(UTF-8)에 먼저 쓰고 콘솔에 쓴다. 로그 파일이 없어도(LOG_FILE=None) 콘솔 쓰기는 같은 방식으로 흡수한다."""
 
     def __init__(self, log, console):
         self.log = log
         self.console = console
 
     def write(self, text):
-        self.log.write(text)
+        if self.log is not None:
+            self.log.write(text)
         _console_write(self.console, text)
         return len(text)
 
     def flush(self):
-        self.log.flush()
+        if self.log is not None:
+            self.log.flush()
         self.console.flush()
 
     def isatty(self):
@@ -172,8 +178,16 @@ def _option_values(argv, options):
 
 
 def _marker_path(name, argv):
+    """표지 파일 경로. 표지 대상이 아닌 모듈이나 --out 이 없는 작업은 None."""
+    if name not in MARKER_MODULES:
+        return None
     out = _option_values(argv, ("--out",))
-    return Path(out[0] + DONE_SUFFIX) if out else None
+    if not out:
+        return None
+    if out[0].endswith(("/", "\\\\")):
+        _fail("out_must_be_file_path", f"--out {out[0]!r} of job {name} ends with a path separator; give a file path, not a folder",
+              f"{name} 작업의 --out {out[0]!r} 가 구분자로 끝난다. 폴더가 아니라 파일 경로를 적는다.")
+    return Path(out[0] + DONE_SUFFIX)
 
 
 def _output_files(name, argv):
@@ -205,17 +219,23 @@ def _marker_state(marker, name, argv):
         done = json.loads(marker.read_text(encoding="utf-8"))
         if not isinstance(done, dict):
             raise ValueError("not an object")
+        if (not isinstance(done.get("module"), str) or not isinstance(done.get("runner_payload_sha256"), str)
+                or not isinstance(done.get("argv"), list) or not isinstance(done.get("input_sha256s"), dict)
+                or not isinstance(done.get("outputs"), list)
+                or not all(isinstance(e, dict) and isinstance(e.get("path"), str) and isinstance(e.get("sha256"), str)
+                           for e in done["outputs"])):
+            raise ValueError("a key is missing or has the wrong type")
     except (OSError, ValueError) as exc:
         return "marker_unreadable", f"표지를 읽을 수 없다 ({type(exc).__name__})", "the marker cannot be read"
     if done.get("runner_payload_sha256") != PAYLOAD_SHA256:
         return "runner_changed", "표지를 만든 때와 이 실행기의 psdl2 판이 다르다", "this runner bundles a different psdl2 build than the one that wrote the marker"
     if done.get("module") != name or done.get("argv") != argv:
         return "inputs_changed", "표지를 만든 때와 작업 모듈 또는 인자가 다르다", "the job module or its arguments differ from the marker"
-    recorded, current = done.get("input_sha256s", {}), _input_hashes(name, argv)
+    recorded, current = done["input_sha256s"], _input_hashes(name, argv)
     if recorded != current:
         changed = sorted(k for k in set(recorded) | set(current) if recorded.get(k) != current.get(k))
         return "inputs_changed", "입력 파일이 표지를 만든 때와 다르다: " + ", ".join(changed), "input files differ from the marker: " + ", ".join(changed)
-    for entry in done.get("outputs", []):
+    for entry in done["outputs"]:
         path = Path(entry["path"])
         if not path.is_file():
             return "output_missing", f"산출물이 없다: {entry['path']}", f"output file is missing: {entry['path']}"
@@ -247,14 +267,22 @@ def _check_requirements(name):
                   f"{name} 작업에는 {dependency} 가 필요한데 이 Python({sys.version.split()[0]})에 없다."
                   f" {dependency} 가 설치된 Python 으로 이 파일을 실행하거나, JOBS 에서 {name} 작업을 뺀다."
                   " 앞 작업의 산출물은 그대로 남아 있다.")
-        try:
-            importlib.import_module(dependency)
-        except Exception as exc:
+        # torch 는 버전 줄을 만들 때 이미 한 번 import 를 시도했다. 다시 import 하지 않고 그 예외를 쓴다.
+        error = TORCH_IMPORT["error"] if dependency == "torch" else None
+        if error is None and dependency != "torch":
+            try:
+                importlib.import_module(dependency)
+            except Exception as exc:
+                error = (type(exc).__name__, str(exc))
+        if error is not None:
             _fail(f"{dependency}_import_failed",
-                  f"importing {dependency} for job {name} failed ({type(exc).__name__}: {exc})."
+                  f"{error[0]}: {error[1]}. Importing {dependency} for job {name} failed."
                   f" Check the {dependency} installation (CUDA and shared libraries). Outputs of earlier jobs are kept",
                   f"{name} 작업을 위한 {dependency} import 가 실패했다."
                   f" {dependency} 설치(CUDA·라이브러리 포함)를 확인한다. 앞 작업의 산출물은 그대로 남아 있다.")
+
+
+@@HOOKS@@
 
 
 def run_jobs(jobs):
@@ -268,13 +296,21 @@ def run_jobs(jobs):
     versions = [f"python {sys.version.split()[0]}", f"numpy {numpy.__version__}"]
     for optional in ("PIL", "torch"):
         try:
-            versions.append(f"{optional} {importlib.import_module(optional).__version__}")
-        except Exception as exc:  # 로그용 정보일 뿐이다
+            module = importlib.import_module(optional)
+            versions.append(f"{optional} {module.__version__}")
+            if optional == "torch":
+                versions.append(f"cuda available: {bool(module.cuda.is_available())}")
+        except Exception as exc:  # 로그용 정보일 뿐이다. torch 예외는 작업 전 검사가 다시 import 하지 않고 쓴다.
             versions.append(f"{optional} unavailable ({type(exc).__name__})")
+            if optional == "torch" and not (isinstance(exc, ModuleNotFoundError) and exc.name == "torch"):
+                TORCH_IMPORT["error"] = (type(exc).__name__, str(exc))
     print(f"[psdl2_job] {stamp()} {' | '.join(versions)} | psdl2 from {psdl2.__file__}", file=sys.stderr, flush=True)
+    _prepare(Path.cwd())
     for name, args in jobs:
         argv = [str(a) for a in args]
         marker = _marker_path(name, argv)
+        if name not in MARKER_MODULES:
+            print(f"[psdl2_job] {stamp()} no done marker for {name} (indirect inputs are not hashed)", file=sys.stderr, flush=True)
         if marker is not None and marker.exists():
             stale = _marker_state(marker, name, argv)
             if stale is None:
@@ -302,6 +338,7 @@ def run_jobs(jobs):
         if code == 0 and marker is not None:
             _write_marker(marker, name, argv, inputs)
             print(f"[psdl2_job] {stamp()} wrote done marker {_rel(marker)}", file=sys.stderr, flush=True)
+    _check(Path.cwd())
 
 
 def _base_dir():
@@ -331,7 +368,7 @@ def _main():
             _fail("log_file_unwritable", f"cannot write LOG_FILE {LOG_FILE!r} under {base} ({type(exc).__name__}: {exc})."
                                          " Set LOG_FILE to a writable path, or to None",
                   f"LOG_FILE {LOG_FILE!r} 를 {base} 아래에 쓸 수 없다. LOG_FILE 을 쓸 수 있는 경로로 고치거나 None 으로 둔다.", early=True)
-        sys.stdout, sys.stderr = _Tee(log, sys.__stdout__), _Tee(log, sys.__stderr__)
+    sys.stdout, sys.stderr = _Tee(log, sys.__stdout__), _Tee(log, sys.__stderr__)
     print(f"[psdl2_job] relative paths resolve from {base} ({source}); launched in {launched_cwd};"
           f" runner {globals().get('__file__')}", file=sys.stderr, flush=True)
     try:
@@ -376,7 +413,19 @@ def _jobs_block(jobs):
     return "\n".join(lines) + "\n"
 
 
-def build(out, *, overwrite=False, jobs=None, log_file=None, header=None):
+DEFAULT_HOOKS = '''def _prepare(base):
+    """작업을 시작하기 전에 한 번 부르는 준비 단계. 기본은 아무것도 하지 않는다."""
+
+
+def _check(base):
+    """모든 작업이 끝난 뒤 한 번 부르는 확인 단계. 기본은 아무것도 하지 않는다."""
+'''
+
+
+def build(out, *, overwrite=False, jobs=None, log_file=None, header=None, jobs_source=None, extra_edit=None, hooks=None,
+          docstring=None):
+    """jobs_source: JOBS 블록을 이 소스 텍스트로 바꾼다(jobs 대신). extra_edit: EDIT 블록 맨 앞에 넣을 소스(예: DEVICE).
+    hooks: _prepare(base)·_check(base) 를 정의하는 소스. docstring: 실행기 맨 위 설명."""
     out = Path(out)
     if out.exists() and not overwrite:
         raise FileExistsError(f"refusing to overwrite {out}; pass --overwrite or choose a new path")
@@ -389,9 +438,14 @@ def build(out, *, overwrite=False, jobs=None, log_file=None, header=None):
     sha = hashlib.sha256(json.dumps({n: e["sha256"] for n, e in files.items()}, sort_keys=True).encode()).hexdigest()
     lines = "\n".join(f'    "{packed[i:i + 100]}"' for i in range(0, len(packed), 100))
     text = TEMPLATE.replace("@@SHA@@", sha).replace("@@PAYLOAD@@", lines)
-    if jobs is not None:
+    if jobs is not None or jobs_source is not None:
         start, end = text.index("JOBS = ["), text.index("LOG_FILE = ")
-        text = text[:start] + _jobs_block(jobs) + text[end:]
+        text = text[:start] + (extra_edit or "") + (jobs_source if jobs_source is not None else _jobs_block(jobs)) + text[end:]
+    if docstring is not None:
+        start = text.index('"""psdl2(DL2)')
+        end = text.index('"""', start + 3) + 3
+        text = text[:start] + '"""' + docstring.replace("@@SHA@@", sha) + '"""' + text[end:]
+    text = text.replace("@@HOOKS@@", (hooks or DEFAULT_HOOKS).rstrip("\n"))
     if log_file is not None:
         start = text.index("LOG_FILE = ")
         end = text.index("\n", start)
