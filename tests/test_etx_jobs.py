@@ -121,6 +121,8 @@ def test_bundles_are_deterministic_and_the_committed_files_are_current(tmp_path)
         builder().main(['--out-dir', str(folder)])
     for name in ('psdl2_job_db_search.py', 'psdl2_job_eval.py'):
         assert (first / name).read_bytes() == (second / name).read_bytes() == (ROOT / 'bundles/etx' / name).read_bytes(), name
+    # T9 adv:3: the unreachable "envelope does not exist yet" branch is gone (a missing envelope stops with input_missing first)
+    assert 'does not exist yet' not in (first / 'psdl2_job_eval.py').read_text(encoding='utf-8')
     with pytest.raises(FileExistsError):
         builder().build_db_search(first / 'psdl2_job_db_search.py')
 
@@ -276,6 +278,9 @@ def test_db_search_without_torch_stops_before_the_grid_is_made(etx_py, tmp_path,
     log = read_log(workspace, DB_LOG)
     assert 'ERROR torch_required_for_make_split:' in log and 'ERROR torch_required_for_make_split:' in proc.err
     assert 'remove the make_split job from JOBS' in log and 'make_split 작업에는 torch 가 필요한데' in log
+    for stream in (proc.err, log):   # T9 adv:1: before any job, "No job has run" replaces the per-job "earlier outputs are kept"
+        assert 'No job has run' in stream and '어떤 작업도 실행하지 않았다' in stream
+        assert 'Outputs of earlier jobs are kept' not in stream and '앞 작업의 산출물' not in stream
     assert started(log) == [] and not (workspace / 'work').exists() and not (workspace / 'dl2_db/db_dataset.grid.json').exists()
 
 
@@ -342,6 +347,12 @@ def test_a_wrongly_typed_edit_value_stops_before_any_job(etx_py, tmp_path, works
     no_job_ran(workspace, which, proc, 'edit_value_invalid', f'{name}={shown} ', 'EDIT 블록', '어떤 작업도 실행하지 않았다', 'No job has run')
 
 
+def test_an_invalid_device_names_the_way_to_pick_a_gpu(etx_py, tmp_path, workspace):  # noqa: F811
+    """T9 adv:5."""
+    proc = execute(etx_py, place(tmp_path, db_text(workspace, values=dict(DB_VALUES, DEVICE='gpu')), 'runner.py'), tmp_path)
+    no_job_ran(workspace, 'db', proc, 'edit_value_invalid', "DEVICE='gpu' ", "DEVICE='cuda' and CUDA_VISIBLE_DEVICES", "DEVICE='cuda' 와 CUDA_VISIBLE_DEVICES 를 쓴다")
+
+
 def test_per_product_topk_none_is_a_valid_value(etx_py, tmp_path, workspace):  # noqa: F811
     text = db_text(workspace, values=dict(DB_VALUES, PER_PRODUCT_TOPK=None))
     proc = execute(etx_py, place(tmp_path, text, 'runner.py'), tmp_path)
@@ -351,6 +362,7 @@ def test_per_product_topk_none_is_a_valid_value(etx_py, tmp_path, workspace):  #
 @pytest.mark.parametrize('content,reason', [
     ('[]', 'must be a non-empty JSON array'), ('{"a": 1}', 'must be a non-empty JSON array'), ('["P0", "P0"]', 'entries must be distinct'),
     ('[1, "P1"]', 'every entry must be a non-empty string'), ('["P0", ""]', 'every entry must be a non-empty string'),
+    ('["P0", "  "]', 'every entry must be a non-empty string'),
     ('not json', 'JSONDecodeError')])
 def test_a_bad_cohort_file_stops_before_any_job(etx_py, tmp_path, workspace, content, reason):  # noqa: F811
     cohort = workspace / 'dl2_db/cohort.json'
@@ -448,11 +460,15 @@ def test_an_envelope_of_this_query_export_passes_and_one_without_hashes_is_not_c
     write_envelope(workspace, [{'query_roi_id': 'q', 'query_export_sha256': hashlib.sha256(query.read_bytes()).hexdigest()}])
     proc = execute(etx_py, place(tmp_path, eval_text(workspace), 'runner.py'), tmp_path)
     assert 'input_mismatch' not in proc.err and 'QUERY_EXPORT check' not in proc.err   # it reached the jobs (the toy envelope fails later)
+    assert 'ranks' not in proc.err   # every query is from QUERY_EXPORT: no mixed-export line
     assert started(read_log(workspace, EVAL_LOG))[:2] == ['baseline_ncc', 'baseline_ncc']
     write_envelope(workspace, [{'query_roi_id': 'q', 'query_export_sha256': 'cd' * 32},   # a query dataset may span several exports
                                {'query_roi_id': 'r', 'query_export_sha256': hashlib.sha256(query.read_bytes()).hexdigest()}])
     proc = execute(etx_py, place(tmp_path, eval_text(workspace), 'runner.py'), tmp_path)
     assert 'input_mismatch' not in proc.err
+    # T9 adv:2: a mixed envelope is reported, not refused
+    assert 'prepare: SEARCH_BATCH ranks 1 of 2 queries from QUERY_EXPORT; 1 from other exports' in proc.err
+    assert '질의 2 개 중 1 개가 QUERY_EXPORT 의 것이고 1 개는 다른 export 의 것이다' in proc.err
     write_envelope(workspace, [{'query_roi_id': 'q', 'query_export_sha256': None}])
     execute(etx_py, place(tmp_path, eval_text(workspace), 'runner.py'), tmp_path)
     assert 'records no query_export_sha256; skipping the QUERY_EXPORT check' in read_log(workspace, EVAL_LOG)

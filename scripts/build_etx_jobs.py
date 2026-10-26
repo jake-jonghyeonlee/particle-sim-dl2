@@ -82,7 +82,7 @@ def _check_cohort(label, path):
         names = json.loads(resolved.read_text(encoding="utf-8"))
         if not isinstance(names, list) or not names:
             raise ValueError("must be a non-empty JSON array of product names")
-        if not all(isinstance(n, str) and n for n in names):
+        if not all(isinstance(n, str) and n.strip() for n in names):
             raise ValueError("every entry must be a non-empty string")
         if len(set(names)) != len(names):
             raise ValueError("entries must be distinct")
@@ -188,13 +188,28 @@ INPUTS = (("DB_DATASET", DB_DATASET, "patches", None), ("QUERY_DATASET", QUERY_D
 @@COMMON@@
 
 
+def _check_requirements_before_jobs(name):
+    """_check_requirements 를 작업 전에 부른다. 작업 단위 문구 "앞 작업의 산출물은 남아 있다" 는 아직 맞지 않으므로 "어떤 작업도 실행하지 않았다" 로 바꾼다."""
+    real_fail = globals()["_fail"]
+
+    def fail(code, english, korean, early=False):
+        real_fail(code, english.replace("Outputs of earlier jobs are kept", "No job has run"),
+                  korean.replace("앞 작업의 산출물은 그대로 남아 있다.", "어떤 작업도 실행하지 않았다."), early)
+    globals()["_fail"] = fail
+    try:
+        _check_requirements(name)
+    finally:
+        globals()["_fail"] = real_fail
+
+
 def _prepare(base):
     """작업 전: EDIT 값·입력 파일·torch·DEVICE 를 검사하고, DB_DATASET 에 grid patch set 을 붙인 manifest(GRID_DATASET)를 쓴다.
     하나라도 틀리면 어떤 작업도 돌기 전에 멈춘다."""
     _check_values(REQUIRED_VALUES)
     _check_settings(SETTINGS)
     if any(_has_job(module) for module in ("train", "index", "search")) and DEVICE not in ("cpu", "cuda"):
-        _invalid("DEVICE", DEVICE, "must be \"cpu\" or \"cuda\"", "는 \"cpu\" 또는 \"cuda\" 여야 한다")
+        _invalid("DEVICE", DEVICE, "must be \"cpu\" or \"cuda\" (to use a GPU, set DEVICE='cuda' and CUDA_VISIBLE_DEVICES)",
+                 "는 \"cpu\" 또는 \"cuda\" 여야 한다 (GPU 를 고르려면 DEVICE='cuda' 와 CUDA_VISIBLE_DEVICES 를 쓴다)")
     _check_names("PRODUCTS", PRODUCTS)
     _check_inputs(INPUTS)
     if not DB_DATASET.endswith(".json"):
@@ -217,7 +232,7 @@ def _prepare(base):
               f"PRODUCTS 는 {len(PRODUCTS)} 개인데 DB_DATASET -> {plain} 의 source 는 {len(sources)} 개다. source 마다 이름 하나를 같은 순서로 적는다.")
     torch_jobs = [name for name, _ in JOBS if "torch" in MODULE_NEEDS.get(name, ())]
     if torch_jobs:
-        _check_requirements(torch_jobs[0])   # torch 가 없으면 grid 를 만들기 전에 torch_required_for_<첫 torch 모듈> 로 멈춘다
+        _check_requirements_before_jobs(torch_jobs[0])   # torch 가 없으면 grid 를 만들기 전에 torch_required_for_<첫 torch 모듈> 로 멈춘다
     if DEVICE == "cuda" and any(_has_job(module) for module in ("train", "index", "search")):
         import torch
         try:
@@ -322,13 +337,11 @@ def _check_envelope():
     """--search-batch 작업이 있고 봉투가 이미 있으면, 봉투가 이 QUERY_EXPORT 의 질의로 만들어졌는지 sha256 으로 대조한다."""
     if not _has_job("eval_position", "--search-batch"):
         return
-    envelope = Path(SEARCH_BATCH).resolve()
-    if not envelope.is_file():
-        _log(f"prepare: SEARCH_BATCH {_rel(envelope)} does not exist yet; skipping the QUERY_EXPORT check")
-        return
+    envelope = Path(SEARCH_BATCH).resolve()   # 봉투가 없으면 _check_inputs 가 input_missing 으로 이미 멈췄다
     try:
         rankings = json.loads(envelope.read_text(encoding="utf-8"))["rankings"]
-        recorded = {r["query_export_sha256"] for r in rankings if r["query_export_sha256"] is not None}
+        hashes = [r["query_export_sha256"] for r in rankings if r["query_export_sha256"] is not None]
+        recorded = set(hashes)
     except (OSError, ValueError, KeyError, TypeError) as exc:
         _input_invalid("SEARCH_BATCH", envelope, f"not a psdl2_search_batch_v1 envelope with rankings ({type(exc).__name__}: {exc})")
     if not recorded:
@@ -343,6 +356,10 @@ def _check_envelope():
               f"QUERY_EXPORT vs SEARCH_BATCH: QUERY_EXPORT 의 sha256 은 {digest[:12]} 인데 SEARCH_BATCH({envelope}) 는"
               f" {', '.join(h[:12] for h in other)} export 의 질의만 검색한 결과다. QUERY_EXPORT 를 db_search 가 검색한 export 로 고치거나"
               " db_search 를 다시 실행한다. 어떤 작업도 실행하지 않았다.")
+    shared = hashes.count(digest)
+    if shared < len(hashes):   # 질의 데이터셋이 export 를 여러 개 가리키면 일부 질의는 다른 export 의 것이다. 멈추지 않고 알린다
+        _log(f"prepare: SEARCH_BATCH ranks {shared} of {len(hashes)} queries from QUERY_EXPORT; {len(hashes) - shared} from other exports"
+             f" | SEARCH_BATCH 는 질의 {len(hashes)} 개 중 {shared} 개가 QUERY_EXPORT 의 것이고 {len(hashes) - shared} 개는 다른 export 의 것이다")
 
 
 def _prepare(base):

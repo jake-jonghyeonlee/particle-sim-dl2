@@ -1630,7 +1630,7 @@ def _check_cohort(label, path):
         names = json.loads(resolved.read_text(encoding="utf-8"))
         if not isinstance(names, list) or not names:
             raise ValueError("must be a non-empty JSON array of product names")
-        if not all(isinstance(n, str) and n for n in names):
+        if not all(isinstance(n, str) and n.strip() for n in names):
             raise ValueError("every entry must be a non-empty string")
         if len(set(names)) != len(names):
             raise ValueError("entries must be distinct")
@@ -1692,13 +1692,11 @@ def _check_envelope():
     """--search-batch 작업이 있고 봉투가 이미 있으면, 봉투가 이 QUERY_EXPORT 의 질의로 만들어졌는지 sha256 으로 대조한다."""
     if not _has_job("eval_position", "--search-batch"):
         return
-    envelope = Path(SEARCH_BATCH).resolve()
-    if not envelope.is_file():
-        _log(f"prepare: SEARCH_BATCH {_rel(envelope)} does not exist yet; skipping the QUERY_EXPORT check")
-        return
+    envelope = Path(SEARCH_BATCH).resolve()   # 봉투가 없으면 _check_inputs 가 input_missing 으로 이미 멈췄다
     try:
         rankings = json.loads(envelope.read_text(encoding="utf-8"))["rankings"]
-        recorded = {r["query_export_sha256"] for r in rankings if r["query_export_sha256"] is not None}
+        hashes = [r["query_export_sha256"] for r in rankings if r["query_export_sha256"] is not None]
+        recorded = set(hashes)
     except (OSError, ValueError, KeyError, TypeError) as exc:
         _input_invalid("SEARCH_BATCH", envelope, f"not a psdl2_search_batch_v1 envelope with rankings ({type(exc).__name__}: {exc})")
     if not recorded:
@@ -1713,6 +1711,10 @@ def _check_envelope():
               f"QUERY_EXPORT vs SEARCH_BATCH: QUERY_EXPORT 의 sha256 은 {digest[:12]} 인데 SEARCH_BATCH({envelope}) 는"
               f" {', '.join(h[:12] for h in other)} export 의 질의만 검색한 결과다. QUERY_EXPORT 를 db_search 가 검색한 export 로 고치거나"
               " db_search 를 다시 실행한다. 어떤 작업도 실행하지 않았다.")
+    shared = hashes.count(digest)
+    if shared < len(hashes):   # 질의 데이터셋이 export 를 여러 개 가리키면 일부 질의는 다른 export 의 것이다. 멈추지 않고 알린다
+        _log(f"prepare: SEARCH_BATCH ranks {shared} of {len(hashes)} queries from QUERY_EXPORT; {len(hashes) - shared} from other exports"
+             f" | SEARCH_BATCH 는 질의 {len(hashes)} 개 중 {shared} 개가 QUERY_EXPORT 의 것이고 {len(hashes) - shared} 개는 다른 export 의 것이다")
 
 
 def _prepare(base):

@@ -1636,7 +1636,7 @@ def _check_cohort(label, path):
         names = json.loads(resolved.read_text(encoding="utf-8"))
         if not isinstance(names, list) or not names:
             raise ValueError("must be a non-empty JSON array of product names")
-        if not all(isinstance(n, str) and n for n in names):
+        if not all(isinstance(n, str) and n.strip() for n in names):
             raise ValueError("every entry must be a non-empty string")
         if len(set(names)) != len(names):
             raise ValueError("entries must be distinct")
@@ -1694,13 +1694,28 @@ def _check_names(label, names):
               f"{label} 는 영문·숫자·_ - . 로 된 서로 다른 이름의 비어 있지 않은 목록이어야 한다. 지금 값: {names!r}")
 
 
+def _check_requirements_before_jobs(name):
+    """_check_requirements 를 작업 전에 부른다. 작업 단위 문구 "앞 작업의 산출물은 남아 있다" 는 아직 맞지 않으므로 "어떤 작업도 실행하지 않았다" 로 바꾼다."""
+    real_fail = globals()["_fail"]
+
+    def fail(code, english, korean, early=False):
+        real_fail(code, english.replace("Outputs of earlier jobs are kept", "No job has run"),
+                  korean.replace("앞 작업의 산출물은 그대로 남아 있다.", "어떤 작업도 실행하지 않았다."), early)
+    globals()["_fail"] = fail
+    try:
+        _check_requirements(name)
+    finally:
+        globals()["_fail"] = real_fail
+
+
 def _prepare(base):
     """작업 전: EDIT 값·입력 파일·torch·DEVICE 를 검사하고, DB_DATASET 에 grid patch set 을 붙인 manifest(GRID_DATASET)를 쓴다.
     하나라도 틀리면 어떤 작업도 돌기 전에 멈춘다."""
     _check_values(REQUIRED_VALUES)
     _check_settings(SETTINGS)
     if any(_has_job(module) for module in ("train", "index", "search")) and DEVICE not in ("cpu", "cuda"):
-        _invalid("DEVICE", DEVICE, "must be \"cpu\" or \"cuda\"", "는 \"cpu\" 또는 \"cuda\" 여야 한다")
+        _invalid("DEVICE", DEVICE, "must be \"cpu\" or \"cuda\" (to use a GPU, set DEVICE='cuda' and CUDA_VISIBLE_DEVICES)",
+                 "는 \"cpu\" 또는 \"cuda\" 여야 한다 (GPU 를 고르려면 DEVICE='cuda' 와 CUDA_VISIBLE_DEVICES 를 쓴다)")
     _check_names("PRODUCTS", PRODUCTS)
     _check_inputs(INPUTS)
     if not DB_DATASET.endswith(".json"):
@@ -1723,7 +1738,7 @@ def _prepare(base):
               f"PRODUCTS 는 {len(PRODUCTS)} 개인데 DB_DATASET -> {plain} 의 source 는 {len(sources)} 개다. source 마다 이름 하나를 같은 순서로 적는다.")
     torch_jobs = [name for name, _ in JOBS if "torch" in MODULE_NEEDS.get(name, ())]
     if torch_jobs:
-        _check_requirements(torch_jobs[0])   # torch 가 없으면 grid 를 만들기 전에 torch_required_for_<첫 torch 모듈> 로 멈춘다
+        _check_requirements_before_jobs(torch_jobs[0])   # torch 가 없으면 grid 를 만들기 전에 torch_required_for_<첫 torch 모듈> 로 멈춘다
     if DEVICE == "cuda" and any(_has_job(module) for module in ("train", "index", "search")):
         import torch
         try:
