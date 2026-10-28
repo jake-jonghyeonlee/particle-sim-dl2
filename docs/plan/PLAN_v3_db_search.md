@@ -44,18 +44,19 @@
 - **R3.** confirm-pairs가 `psdl2_search_batch_v1`를 읽는다.
   - R3a. `schema_version`으로 분기한다. 기존 NCC 경로는 그대로 둔다.
   - R3b. 후보 필드는 `rankings[].candidates[]`의 `rank`, `frame_id`, `center_xy_um`, `product_id`다.
-  - R3c. 질의 export 해시는 `rankings[i].query_export_sha256`을 먼저 쓴다. 질의가 dataset이면 `inputs.query_export_sha256`은 `null`이다. 후보 제품의 export는 `index_sources[]`와 대조한다. `product_ids`가 `null`이면 그 후보는 검증할 수 없으므로 unusable이다. `index_sources`가 `"single_export"`이면 따로 분기한다.
+  - R3c. 질의 export 해시는 `rankings[i].query_export_sha256`을 먼저 쓴다. 질의가 dataset이면 `inputs.query_export_sha256`은 `null`이다. 후보 제품의 export는 `index_sources[]`와 대조한다. `--all-ready` CLI는 `rankings[i].query_export_sha256`에 늘 문자열을 쓴다. reader는 `null`을 "알 수 없음 → 검증 불가(unusable)"로 다룬다. `product_ids`가 `null`이면 그 후보는 검증할 수 없으므로 unusable이다. `index_sources`가 `"single_export"`이면 따로 분기한다.
   - R3d. 설정에 없는 후보 제품은 `candidate_product_not_configured`로 unusable이다.
   - R3e. `roi_correspondence_v1`은 쌍 단위로 유지된다고 가정한다. **compare의 확인이 필요하다.**
   - R3f. DL2 합성 교환 fixture 위치: 없음 — 필요 시 별도 Task. (smoke 번들 `psdl2_job_smoke_torch.py`가 실행할 때 합성 `roi_correspondence_v1`과 `psdl2_search_batch_v1`를 만들지만, 저장소에 고정 파일은 없다.)
 - **R4.** seal/read의 배치 봉투 지원은 보류한다.
-- **R5.** compare의 `docs/handoff/README.md`에 있는 DL2 pin을 이 브랜치의 병합 commit으로 갱신한다. `efc6dac` 이후 변경분도 이때 처음 pin에 들어간다.
+- **R5.** compare의 `docs/handoff/README.md`에 있는 DL2 pin을 이 브랜치의 병합 commit으로 갱신한다. `efc6dac`(PLAN_v2 patch generator)부터의 변경분이 이때 처음 pin에 들어간다. 새 pin 후보는 이 브랜치의 병합 commit이다.
 
 ## 6. 확인하지 못한 것
 
 | 항목 | 상태 |
 |---|---|
 | Linux에서 실제 실행 | 확인 못 함. 로컬 Python 3.9 venv에서만 시험했다 |
+| ETX 실제 패키지 판 | 사용자 보고값(Python 3.9.14, numpy 1.23.5, Pillow 10.1.0, torch 2.1.1+cu121)으로 로컬 재현; ETX 서버에서 실행 미확인 |
 | CUDA (cu121) | 확인 못 함. 시험은 CPU뿐이다 |
 | 실데이터 규모·메모리·시간 | 확인 못 함. 봉투 크기 추정식 `Q × (8.5 KB + 0.15 KB × M + 9.8 KB × T)`는 합성 실측 1점에서 맞춘 값이며, `M` 계수는 추정이다 |
 | compare의 변경점 형식 | 미확정. 지금은 R1·R2의 형식을 가정한다 |

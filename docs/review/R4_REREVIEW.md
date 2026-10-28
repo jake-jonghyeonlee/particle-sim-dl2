@@ -1,7 +1,7 @@
 # R4b 독립 재검토 — DL2 R4 수정본
 
 - 검토자: fresh Claude Opus 5.5 세션 (작성자·coordinator·1차 검토자 아님), 읽기 전용
-- 대상: `/Users/jonghyeonlee/git/particle-sim-dl2`, branch `main`, commit `e03cb5c9cce7a36dfb73c0c53b2a9f99eb1448ba` (R4 보고 commit `9849300` 위의 수정 commit, 1차 검토 대상 `c19a33d`)
+- 대상: particle-sim-dl2 저장소, branch `main`, commit `e03cb5c9cce7a36dfb73c0c53b2a9f99eb1448ba` (R4 보고 commit `9849300` 위의 수정 commit, 1차 검토 대상 `c19a33d`)
 - 계약: PLAN_v2 §2.4, §2.5, T10, T11 / `docs/review/R4_REVIEW.md` / `docs/review/R4_FIXES.md`
 - 검토일: 2026-10-09
 

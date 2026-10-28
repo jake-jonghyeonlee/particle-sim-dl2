@@ -71,7 +71,7 @@
 
 ### T0b — sim-compare `export-template-rois` (High, D7)
 
-- **대상.** `/Users/jonghyeonlee/git/particle-sim-compare`, 새 브랜치 `feat/template-export`(기준 `f30111c`).
+- **대상.** particle-sim-compare 저장소, 새 브랜치 `feat/template-export`(기준 `f30111c`).
 - **새 명령** `simcompare export-template-rois --config <yaml> --out <없는 폴더>`. 제품 하나, 데이터셋 하나.
 - **입력 `template_export_config_v1`.** 1.png/2.png만 있는 트리, `cnt_from_dl1_root`, id 필드, `layer_stack`(actual_layer, stack_order만), role 규칙, `source_version`, `max_asset_memory_mb`, case별 `center_xy_um`, `mask_derivation_rule: between_stack_order_v1`(이 값만 허용, 생략하면 exit 2). `density_process_layer`는 받지 않고 내부 sentinel로 채운다.
 - **hotspot 미접촉.** 트리에서 hotspot 파일명 패턴이나 `result/`가 보이면 열지 않고 `template_hotspot_input_present`로 exit 2.

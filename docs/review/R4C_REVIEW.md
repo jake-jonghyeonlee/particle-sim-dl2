@@ -1,7 +1,7 @@
 # R4c 독립 재검토 — DL2 view 연결성 v3 수정본
 
 - 검토자: fresh Claude Opus 5.5 세션 (작성자·coordinator·R4/R4b 검토자 아님), 읽기 전용
-- 대상: `/Users/jonghyeonlee/git/particle-sim-dl2`, branch `main`, commit `b0b11673fffdaaa88af890670c88439e63605ad8`
+- 대상: particle-sim-dl2 저장소, branch `main`, commit `b0b11673fffdaaa88af890670c88439e63605ad8`
 - 계약: `PLAN_v2_ADDENDUM_DL2_VIEWS.md` §1–§8 (구속), PLAN_v2 §2.4, §2.5, T10, T11
 - 이력: R4 (`c19a33d` FAIL) → `e03cb5c` → R4b (`e03cb5c` FAIL: B3, P1, M1–M8) → 보완 계획 채택 → `b0b1167`
 - 검토일: 2026-10-09

@@ -474,6 +474,43 @@ def test_an_envelope_of_this_query_export_passes_and_one_without_hashes_is_not_c
     assert 'records no query_export_sha256; skipping the QUERY_EXPORT check' in read_log(workspace, EVAL_LOG)
 
 
+def test_a_mixed_envelope_counts_every_ranking_and_names_the_unhashed_ones(etx_py, tmp_path, workspace):  # noqa: F811
+    """T10 adv:4: n is len(rankings); queries without a hash are named apart."""
+    query = workspace / 'dl2_db/templates/P0/review_rois.json'
+    write_envelope(workspace, [{'query_roi_id': 'q', 'query_export_sha256': 'cd' * 32},
+                               {'query_roi_id': 'r', 'query_export_sha256': hashlib.sha256(query.read_bytes()).hexdigest()},
+                               {'query_roi_id': 's', 'query_export_sha256': None}])
+    proc = execute(etx_py, place(tmp_path, eval_text(workspace), 'runner.py'), tmp_path)
+    assert 'input_mismatch' not in proc.err
+    assert 'prepare: SEARCH_BATCH ranks 1 of 3 queries from QUERY_EXPORT; 1 from other exports (1 without an export hash)' in proc.err
+    assert '질의 3 개 중 1 개가 QUERY_EXPORT 의 것이고 1 개는 다른 export 의 것이다 (export 해시가 없는 질의 1 개 포함)' in proc.err
+
+
+def test_the_pre_run_wording_replaces_the_per_job_sentence_and_warns_when_the_hook_misses(etx_py, tmp_path, workspace):  # noqa: F811
+    """T10 adv:3: a broken torch is reported before any job ("No job has run"); an unmatched replacement warns and keeps the text."""
+    text = db_text(workspace)
+    script = place(tmp_path, text, 'runner.py')
+    digest = re.search(r'PAYLOAD_SHA256 = "([0-9a-f]{64})"', text).group(1)
+    package_root = script.parent / f'.psdl2_pkg_{digest[:12]}'
+    package_root.mkdir()
+    (package_root / 'torch.py').write_text('raise ImportError("broken torch for the test")\n', encoding='utf-8')
+    proc = execute(etx_py, script, tmp_path)
+    assert proc.returncode == 2 and 'ERROR torch_import_failed: ImportError: broken torch for the test.' in proc.err
+    assert 'No job has run' in proc.err and '어떤 작업도 실행하지 않았다' in proc.err
+    assert 'Outputs of earlier jobs are kept' not in proc.err and '앞 작업의 산출물' not in proc.err
+    assert 'wording_hook_missed' not in proc.err
+    # an unmatched replacement: the original sentence stays and one WARNING line is written
+    changed = place(tmp_path, text.replace('"Outputs of earlier jobs are kept", "No job has run"', '"Outputs of earlier JOBS are kept", "No job has run"'),
+                    'runner2.py')
+    digest2 = re.search(r'PAYLOAD_SHA256 = "([0-9a-f]{64})"', changed.read_text(encoding='utf-8')).group(1)
+    package_root2 = changed.parent / f'.psdl2_pkg_{digest2[:12]}'
+    package_root2.mkdir(exist_ok=True)
+    (package_root2 / 'torch.py').write_text('raise ImportError("broken torch for the test")\n', encoding='utf-8')
+    proc = execute(etx_py, changed, tmp_path)
+    assert proc.returncode == 2 and 'WARNING wording_hook_missed: torch_import_failed' in proc.err
+    assert 'Outputs of earlier jobs are kept' in proc.err
+
+
 def test_an_unreadable_envelope_stops_eval_before_any_job(etx_py, tmp_path, workspace):  # noqa: F811
     (workspace / 'work/db_out').mkdir(parents=True)
     envelope = workspace / 'work/db_out/search_batch.json'

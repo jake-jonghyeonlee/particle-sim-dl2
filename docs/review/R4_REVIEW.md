@@ -1,7 +1,7 @@
 # R4 독립 코드 검토 — DL2 (T10 + T11)
 
 - 검토자: fresh Claude Opus 5.5 세션 (작성자·coordinator 아님), 읽기 전용
-- 대상: `/Users/jonghyeonlee/git/particle-sim-dl2`, branch `main`, commit `c19a33d` (T10 = `836ee0f`, baseline `886aa74`)
+- 대상: particle-sim-dl2 저장소, branch `main`, commit `c19a33d` (T10 = `836ee0f`, baseline `886aa74`)
 - 계약: PLAN_v2 §2.4, §2.5, T10, T11, §8 R4 행 / `review_roi_contract.md` / `implementation_memory.json`의 `gate_answers_2026_10_09_dl2_and_hotspot_format`
 - 검토일: 2026-10-09
 

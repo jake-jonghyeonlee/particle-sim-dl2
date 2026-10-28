@@ -193,8 +193,11 @@ def _check_requirements_before_jobs(name):
     real_fail = globals()["_fail"]
 
     def fail(code, english, korean, early=False):
-        real_fail(code, english.replace("Outputs of earlier jobs are kept", "No job has run"),
-                  korean.replace("앞 작업의 산출물은 그대로 남아 있다.", "어떤 작업도 실행하지 않았다."), early)
+        new_english = english.replace("Outputs of earlier jobs are kept", "No job has run")
+        new_korean = korean.replace("앞 작업의 산출물은 그대로 남아 있다.", "어떤 작업도 실행하지 않았다.")
+        if new_english == english and "No job has run" not in english or new_korean == korean and "어떤 작업도 실행하지 않았다" not in korean:
+            _log(f"WARNING wording_hook_missed: {code}")   # 문구가 바뀌어 치환이 안 맞았다. 원 문구를 그대로 쓰고 멈추지 않는다
+        real_fail(code, new_english, new_korean, early)
     globals()["_fail"] = fail
     try:
         _check_requirements(name)
@@ -357,9 +360,13 @@ def _check_envelope():
               f" {', '.join(h[:12] for h in other)} export 의 질의만 검색한 결과다. QUERY_EXPORT 를 db_search 가 검색한 export 로 고치거나"
               " db_search 를 다시 실행한다. 어떤 작업도 실행하지 않았다.")
     shared = hashes.count(digest)
+    total = len(rankings)
+    unhashed = total - len(hashes)
     if shared < len(hashes):   # 질의 데이터셋이 export 를 여러 개 가리키면 일부 질의는 다른 export 의 것이다. 멈추지 않고 알린다
-        _log(f"prepare: SEARCH_BATCH ranks {shared} of {len(hashes)} queries from QUERY_EXPORT; {len(hashes) - shared} from other exports"
-             f" | SEARCH_BATCH 는 질의 {len(hashes)} 개 중 {shared} 개가 QUERY_EXPORT 의 것이고 {len(hashes) - shared} 개는 다른 export 의 것이다")
+        note_en = f" ({unhashed} without an export hash)" if unhashed else ""
+        note_ko = f" (export 해시가 없는 질의 {unhashed} 개 포함)" if unhashed else ""
+        _log(f"prepare: SEARCH_BATCH ranks {shared} of {total} queries from QUERY_EXPORT; {len(hashes) - shared} from other exports{note_en}"
+             f" | SEARCH_BATCH 는 질의 {total} 개 중 {shared} 개가 QUERY_EXPORT 의 것이고 {len(hashes) - shared} 개는 다른 export 의 것이다{note_ko}")
 
 
 def _prepare(base):

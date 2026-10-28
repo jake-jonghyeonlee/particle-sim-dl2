@@ -328,6 +328,7 @@ validates the index once, `src/psdl2/search.py:355-357`). It is the same as the 
 - Each ranking has `query_roi_id`, `query_product_id`, `query_export_sha256` and `candidates` (`src/psdl2/search.py:216-217`).
 - `rankings[i].query_export_sha256` is the sha256 of the export the query ROI belongs to. For a single export it is the file's hash. For a dataset it is the hash of the query's source: a patch row maps through its patch-set hash, any other row through the roi ids of the source's export file. An unknown source is the error `query_export_unknown` (`src/psdl2/search.py:253-276`).
   A reader must prefer this value; `inputs.query_export_sha256` is `null` for dataset queries.
+  The `--all-ready` CLI always writes a string here (`src/psdl2/search.py:253-276`). A reader treats `null` as "unknown, so unverifiable (unusable)".
 
 ## `psdl2_eval_position_multi_v1` — multi-product position evaluation
 
@@ -352,7 +353,7 @@ Other `summary` keys (`src/psdl2/eval_position.py:279-289`): `n_queries_without_
 
 **`per_product`** (`src/psdl2/eval_position.py:252-258, 276-278`): keyed by truth product, sorted. Each value has `n_queries_with_truth`, `n_queries_with_prediction`, `n_top1_hit`, `n_hit_at_k`, `top1_hit_rate`, `hit_rate_at_<k>`. Both rates use `n_queries_with_truth` of that product. A query with truth in two products counts once in each.
 
-**`baseline_missing_for_truth_product`** (`src/psdl2/eval_position.py:232-235, 240-241, 289`): in multi-baseline mode, a truth product with no baseline file. The query stays in the denominator as a miss, the entry reason is `baseline_missing_for_truth_product`, and the product is listed here (sorted).
+**`baseline_missing_for_truth_product`** (`src/psdl2/eval_position.py:232-235, 240-241, 289`): in multi-baseline mode, a truth product with no baseline file. The entry of that product is `unavailable` with the reason `baseline_missing_for_truth_product`, and the product is listed here (sorted). The query stays in the denominator. It is a miss unless another truth product of the query is available and has a hit (`src/psdl2/eval_position.py:240-241, 265-269`).
 
 **Prediction and hit rules.**
 

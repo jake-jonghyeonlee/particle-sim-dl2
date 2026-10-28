@@ -1699,8 +1699,11 @@ def _check_requirements_before_jobs(name):
     real_fail = globals()["_fail"]
 
     def fail(code, english, korean, early=False):
-        real_fail(code, english.replace("Outputs of earlier jobs are kept", "No job has run"),
-                  korean.replace("앞 작업의 산출물은 그대로 남아 있다.", "어떤 작업도 실행하지 않았다."), early)
+        new_english = english.replace("Outputs of earlier jobs are kept", "No job has run")
+        new_korean = korean.replace("앞 작업의 산출물은 그대로 남아 있다.", "어떤 작업도 실행하지 않았다.")
+        if new_english == english and "No job has run" not in english or new_korean == korean and "어떤 작업도 실행하지 않았다" not in korean:
+            _log(f"WARNING wording_hook_missed: {code}")   # 문구가 바뀌어 치환이 안 맞았다. 원 문구를 그대로 쓰고 멈추지 않는다
+        real_fail(code, new_english, new_korean, early)
     globals()["_fail"] = fail
     try:
         _check_requirements(name)

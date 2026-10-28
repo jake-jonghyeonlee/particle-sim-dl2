@@ -240,6 +240,7 @@ Scope: `psdl2_search_batch_v1`, `psdl2_eval_position_multi_v1`, the ETX runners 
 - **Real-data runners:** `psdl2_job_db_search.py` and `psdl2_job_eval.py` run end to end on synthetic data (db_search in `venv39-torch`, then eval in `venv39-notorch`), including a non-ASCII and space-containing `BASE_DIR`, `-I`, another working directory and restart (`tests/test_etx_jobs.py`). Pre-run checks stop before any job on `FILL_ME` values, missing inputs and inconsistent manifests.
 - **Not verified:**
   - A real Linux ETX run (file permissions, environment differences).
+  - ETX actual package versions: reproduced locally with the user-reported values (Python 3.9.14, numpy 1.23.5, Pillow 10.1.0, torch 2.1.1+cu121); not run on the ETX server.
   - CUDA (the ETX build is cu121; every test runs on CPU).
   - Real-data size, memory and time. The envelope-size formula `Q × (8.5 KB + 0.15 KB × M + 9.8 KB × T)` comes from one synthetic measurement (Q=3, M=19, T=4: 153,194 bytes). The `M` coefficient is an estimate.
   - Ranking quality. A one-epoch synthetic model shows no ranking quality, and the synthetic truth makes no claim about hit rates.
